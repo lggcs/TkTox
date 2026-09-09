@@ -12,13 +12,28 @@ add_compile_options(-Wall -Wextra -Wformat=2 -Wformat-security -Wundef
 
 find_package(PkgConfig REQUIRED)
 # UI: Tk 8.6 (portable, C-embedded interp, no Tcl scripts).
-pkg_check_modules(TCLTK REQUIRED tcl8.6 tk8.6)
-pkg_check_modules(SODIUM REQUIRED libsodium)
 # alsa (libasound) drives the M-AV3 audio device layer.
-pkg_check_modules(ALSA REQUIRED alsa)
 # Vendored deps resolve through PKG_CONFIG_PATH; pass their lib dirs to the linker.
 # xft is included so the linker can resolve libtk8.6's transitive libXft dependency.
 # opus/vpx provide toxav's codecs (extracted from Ubuntu dev debs).
+#
+# Link mode selects static vs dynamic resolution:
+#   static  -> pkg-config --static (all .a); ALSA stays shared (Ubuntu ships
+#              libasound shared-only), so glibc stays dynamic too.
+#   dynamic -> pkg-config --libs (all .so).
+# pkg_check_modules always populates <prefix>_STATIC_LIBRARIES (the --static
+# libs); we select them explicitly for the static path.
+pkg_check_modules(TCLTK REQUIRED tcl8.6 tk8.6)
+pkg_check_modules(SODIUM REQUIRED libsodium)
+pkg_check_modules(OPUS REQUIRED opus)
+pkg_check_modules(VPX REQUIRED vpx)
+pkg_check_modules(XFT REQUIRED xft)
+pkg_check_modules(ALSA REQUIRED alsa)
+if(TT_LINK_MODE STREQUAL "static")
+  set(TT_STATIC_LIBS
+    ${SODIUM_STATIC_LIBRARIES} ${TCLTK_STATIC_LIBRARIES}
+    ${OPUS_STATIC_LIBRARIES} ${VPX_STATIC_LIBRARIES} ${XFT_STATIC_LIBRARIES})
+endif()
 #
 # The deb multiarch triplet is the single arch knob: it drives the vendored
 # .deps/<pkg>/usr/lib/<triplet> layout. It defaults from the host/target
@@ -62,6 +77,14 @@ set(DHT_BOOTSTRAP OFF CACHE BOOL "" FORCE)
 set(BOOTSTRAP_DAEMON OFF CACHE BOOL "" FORCE)
 set(BUILD_TOXAV ON CACHE BOOL "" FORCE)
 set(MUST_BUILD_TOXAV ON CACHE BOOL "" FORCE)
+# Build only the toxcore flavor the link mode needs (avoids building both).
+if(TT_LINK_MODE STREQUAL "static")
+  set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+  set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
+else()
+  set(ENABLE_SHARED ON CACHE BOOL "" FORCE)
+  set(ENABLE_STATIC OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/vendor/c-toxcore toxcore_build)
 
 # Post-quantum KEM (Streamlined NTRU Prime 761), public-domain supercop code,
@@ -91,8 +114,30 @@ set(TT_SOURCES
 
 add_executable(TkTox ${TT_SOURCES})
 target_include_directories(TkTox PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(TkTox PRIVATE toxcore_static sntrup761 ${SODIUM_LIBRARIES}
-  ${TCLTK_LIBRARIES} asound)
+
+# ---- Link the two build paths ----
+# static:  everything static except ALSA. Ubuntu ships libasound shared-only, so
+#          ALSA (and therefore glibc) stays dynamic. We wrap the static libs in
+#          -Wl,-Bstatic ... -Wl,-Bdynamic so the linker prefers .a for them and
+#          falls back to .so for asound and the C runtime. The --start-group
+#          resolves the circular static deps (tk<->tcl, vpx<->pthread, etc.).
+# dynamic: everything shared; toxcore_shared carries its own deps.
+if(TT_LINK_MODE STREQUAL "static")
+  target_link_libraries(TkTox PRIVATE
+    -Wl,-Bstatic -Wl,--start-group
+    toxcore_static sntrup761 ${TT_STATIC_LIBS}
+    -Wl,--end-group -Wl,-Bdynamic
+    asound)
+else()
+  # Link xft explicitly: it is a transitive dep of libtk8.6.so, and RUNPATH
+  # does not propagate to transitive deps — without it the loader cannot find
+  # libXft.so.2 at runtime. --no-as-needed forces it into NEEDED even though
+  # the executable references no Xft symbols directly, so the executable's
+  # RUNPATH (which includes the vendored xft dir) resolves it.
+  target_link_libraries(TkTox PRIVATE
+    toxcore_shared sntrup761 ${SODIUM_LIBRARIES} ${TCLTK_LIBRARIES}
+    -Wl,--no-as-needed ${XFT_LIBRARIES} -Wl,--as-needed asound)
+endif()
 # Stage toxcore public headers into build/toxinclude/tox/ so #include <tox/tox.h> works
 # without installing (upstream headers are flat; install layout nests them under tox/).
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/toxinclude/tox)
@@ -106,4 +151,4 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/vendor/c-toxcore/toxav/toxav.h
   ${CMAKE_BINARY_DIR}/toxinclude/tox/ COPYONLY)
 target_include_directories(TkTox SYSTEM PRIVATE ${CMAKE_BINARY_DIR}/toxinclude)
 target_include_directories(TkTox SYSTEM PRIVATE ${TCLTK_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS}
-  ${ALSA_INCLUDE_DIRS})
+  ${OPUS_INCLUDE_DIRS} ${VPX_INCLUDE_DIRS} ${XFT_INCLUDE_DIRS} ${ALSA_INCLUDE_DIRS})

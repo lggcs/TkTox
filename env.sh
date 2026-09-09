@@ -30,7 +30,7 @@ TT_DEPS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/vendor/.deps
 
 # pkg-config search path: vendored .pc dirs first, then the system triplet.
 TT_PC=""
-for pkg in tcl tk sodium opus vpx alsa; do
+for pkg in tcl tk sodium opus vpx xft alsa; do
     TT_PC="$TT_DEPS_ROOT/$pkg/usr/lib/$TT_DEPS_TRIPLET/pkgconfig${TT_PC:+:$TT_PC}"
 done
 export PKG_CONFIG_PATH="$TT_PC:/usr/lib/$TT_DEPS_TRIPLET/pkgconfig:/usr/share/pkgconfig"

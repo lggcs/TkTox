@@ -1,5 +1,6 @@
 # Build output (regenerable)
 /build/
+/build-*/
 
 # Vendored deps (regenerable via `bash fetch-deps.sh <arch>`)
 /vendor/
