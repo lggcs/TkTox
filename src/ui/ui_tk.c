@@ -13,6 +13,7 @@
 
 #include "ui.h"
 #include "../app_state.h"
+#include "../history.h"
 #include "../log.h"
 #include <tcl.h>
 #include <tk.h>
@@ -53,6 +54,8 @@ typedef struct Contact {
     char name[TT_NAME_MAX];
     char status_msg[TOX_MAX_STATUS_MESSAGE_LENGTH + 1];
     char key_hex[65];        /* request rows */
+    char pubkey_hex[65];     /* established friend: 64-hex public key */
+    time_t last_online;      /* unix time the friend was last seen online (0 = never) */
     char last[TT_LAST_MAX];  /* list preview */
     int conn;                /* Tox_Connection */
     int presence;            /* Tox_User_Status */
@@ -99,6 +102,7 @@ typedef struct GroupMember {
     uint32_t pid;             /* tox peer id */
     char name[TT_NAME_MAX];
     int role;                 /* Tox_Group_Role */
+    bool ignored;             /* local-only: peer's messages muted (gc_set_ignore) */
     bool announce;            /* join announcement pending (name not yet known) */
     struct GroupMember *next;
 } GroupMember;
@@ -109,6 +113,7 @@ typedef struct Group {
     char topic[TOX_GROUP_MAX_TOPIC_LENGTH + 1];
     char chat_id_hex[TOX_GROUP_CHAT_ID_SIZE * 2 + 1]; /* from SYNC burst */
     int self_role;            /* Tox_Group_Role, from SYNC burst */
+    uint32_t self_pid;        /* our own peer id in this group (SYNC -11) */
     int privacy;              /* 0 public, 1 private (NEW event) */
     int voice;                /* Tox_Group_Voice_State (STATE -1 events) */
     int topic_lock;           /* 0/1 (STATE -2 events) */
@@ -859,6 +864,107 @@ static void group_append(Group *g, const char *who, int me, const char *text) {
     transcript_append(g->transcript, g->last, who, me, text);
 }
 
+/* ---- chat-history persistence ----
+   Transcripts are saved to "<profile>.hist" (encrypted with the at-rest
+   pass key) keyed by the friend's 64-hex public key or the group's 64-hex
+   chat id. Loaded at startup once the initial friend/group lists arrive. */
+
+/* Build the stable identity key for a contact: the friend's public key.
+   Returns false if the key is not yet known (the transcript is then not
+   persisted — it has no durable identity to key on). */
+static bool contact_hist_key(const Contact *c, char *out, size_t cap) {
+    if (!c->pubkey_hex[0]) return false;
+    snprintf(out, cap, "%s", c->pubkey_hex);
+    return true;
+}
+
+static bool group_hist_key(const Group *g, char *out, size_t cap) {
+    if (!g->chat_id_hex[0]) return false;
+    snprintf(out, cap, "%s", g->chat_id_hex);
+    return true;
+}
+
+/* Save every non-empty transcript to the sidecar. Called on UI shutdown. */
+static void history_save(Ui *ui) {
+    if (!ui->tt->profile_path) return;
+    /* count entries first (contacts + groups with a key and transcript) */
+    size_t cap = 0;
+    for (Contact *c = ui->contacts; c; c = c->next) {
+        char k[65];
+        if (c->transcript[0] && contact_hist_key(c, k, sizeof k)) cap++;
+    }
+    for (Group *g = ui->groups; g; g = g->next) {
+        char k[65];
+        if (g->transcript[0] && group_hist_key(g, k, sizeof k)) cap++;
+    }
+    if (cap == 0) return;
+    TTHistEntry *entries = calloc(cap, sizeof *entries);
+    if (!entries) return;
+    size_t n = 0;
+    for (Contact *c = ui->contacts; c; c = c->next) {
+        char k[65];
+        if (c->transcript[0] && contact_hist_key(c, k, sizeof k)) {
+            entries[n].key = c->pubkey_hex;
+            entries[n].transcript = c->transcript;
+            n++;
+        }
+    }
+    for (Group *g = ui->groups; g; g = g->next) {
+        char k[65];
+        if (g->transcript[0] && group_hist_key(g, k, sizeof k)) {
+            entries[n].key = g->chat_id_hex;
+            entries[n].transcript = g->transcript;
+            n++;
+        }
+    }
+    if (n > 0)
+        tt_hist_save(ui->tt->profile_path, ui->tt->pass_key, entries, n);
+    free(entries);
+}
+
+/* Load a contact's transcript from the sidecar (no-op when absent). */
+static void history_load_contact(Ui *ui, Contact *c) {
+    char k[65];
+    if (!contact_hist_key(c, k, sizeof k)) return;
+    char buf[TT_TRANSCRIPT_MAX];
+    if (tt_hist_load(ui->tt->profile_path, ui->tt->pass_key, k, buf, sizeof buf)) {
+        size_t n = strlen(buf);
+        if (n >= sizeof c->transcript) n = sizeof c->transcript - 1;
+        memcpy(c->transcript, buf, n);
+        c->transcript[n] = '\0';
+        /* refresh the roster preview from the last line */
+        const char *p = c->transcript + strlen(c->transcript);
+        while (p > c->transcript && p[-1] != '\n') p--;
+        if (*p) {
+            char *f3 = strchr(p, '\x1f');
+            f3 = f3 ? strchr(f3 + 1, '\x1f') : NULL;
+            f3 = f3 ? strchr(f3 + 1, '\x1f') : NULL;
+            if (f3) snprintf(c->last, sizeof c->last, "%s", f3 + 1);
+        }
+    }
+}
+
+/* Load a group's transcript from the sidecar. */
+static void history_load_group(Ui *ui, Group *g) {
+    char k[65];
+    if (!group_hist_key(g, k, sizeof k)) return;
+    char buf[TT_TRANSCRIPT_MAX];
+    if (tt_hist_load(ui->tt->profile_path, ui->tt->pass_key, k, buf, sizeof buf)) {
+        size_t n = strlen(buf);
+        if (n >= sizeof g->transcript) n = sizeof g->transcript - 1;
+        memcpy(g->transcript, buf, n);
+        g->transcript[n] = '\0';
+        const char *p = g->transcript + strlen(g->transcript);
+        while (p > g->transcript && p[-1] != '\n') p--;
+        if (*p) {
+            char *f3 = strchr(p, '\x1f');
+            f3 = f3 ? strchr(f3 + 1, '\x1f') : NULL;
+            f3 = f3 ? strchr(f3 + 1, '\x1f') : NULL;
+            if (f3) snprintf(g->last, sizeof g->last, "%s", f3 + 1);
+        }
+    }
+}
+
 static void hist_tabs_update(Ui *ui) {
     EV("winfo", "width", ".main.chat.hf.hist");
     int wiw = atoi(Tcl_GetStringResult(ui->interp));
@@ -1360,6 +1466,24 @@ static void handle_event(Ui *ui, TTEvent *e) {
             show_selected(ui);
         break;
     }
+    case TT_EV_FRIEND_PUBKEY: {
+        Contact *c = contact_by_fn(ui, e->friend_number);
+        if (!c) c = contact_add(ui, e->friend_number, false);
+        if (!c || !e->str) break;
+        size_t n = e->str_len < sizeof c->pubkey_hex - 1 ? e->str_len : sizeof c->pubkey_hex - 1;
+        memcpy(c->pubkey_hex, e->str, n);
+        c->pubkey_hex[n] = '\0';
+        break;
+    }
+    case TT_EV_FRIEND_LAST_ONLINE: {
+        Contact *c = contact_by_fn(ui, e->friend_number);
+        if (!c) c = contact_add(ui, e->friend_number, false);
+        if (!c) break;
+        c->last_online = (time_t)e->ival;
+        if (ui->sel_kind == TT_SEL_CHAT && ui->sel_fn == e->friend_number)
+            show_selected(ui);
+        break;
+    }
     case TT_EV_FRIEND_MESSAGE: {
         Contact *c = contact_by_fn(ui, e->friend_number);
         if (!c) c = contact_add(ui, e->friend_number, false);
@@ -1545,6 +1669,13 @@ static void handle_event(Ui *ui, TTEvent *e) {
         break;
     case TT_EV_FRIEND_LIST_END:
         ui->ready = true;
+        /* restore persisted chat history now that every friend's public key
+           is known (pubkey events precede FRIEND_LIST_END) */
+        if (ui->tt->profile_path) {
+            for (Contact *c = ui->contacts; c; c = c->next)
+                if (!c->is_request) history_load_contact(ui, c);
+            roster_render(ui);
+        }
         break;
     case TT_EV_AVATAR_SELF:
         if (e->str && e->str_len) {
@@ -1958,6 +2089,40 @@ static void handle_event(Ui *ui, TTEvent *e) {
             hist_append_live(ui, NULL, 2, line);
         break;
     }
+    case TT_EV_GROUP_IGNORE_SELF: {
+        /* actor-side ignore confirmation (gc_set_ignore is local-only) */
+        Group *g = group_by_gn(ui, e->friend_number);
+        if (!g) break;
+        bool failed = e->ival2 >= TT_MOD_EV_FAIL_BASE;
+        bool ignored = !failed && e->ival2 != 0;
+        GroupMember *m = group_member(g, (uint32_t)e->ival);
+        const char *who = (m && m->name[0]) ? m->name
+                          : (e->str && e->str_len ? e->str : "peer");
+        char line[TT_NAME_MAX + 96];
+        if (failed) {
+            snprintf(line, sizeof line, "could not %s %s (peer gone)",
+                     ignored ? "ignore" : "unignore", who);
+        } else {
+            if (m) m->ignored = ignored;
+            snprintf(line, sizeof line, "you %s %s",
+                     ignored ? "ignored" : "unignored", who);
+            /* refresh the open members dialog row button label */
+            EV("winfo", "exists", ".gm");
+            if (ui->sel_kind == TT_SEL_GROUP && ui->sel_fn == g->gn &&
+                strcmp(Tcl_GetStringResult(ui->interp), "1") == 0) {
+                char fr[24], irow[64];
+                snprintf(fr, sizeof fr, "%u", (unsigned)e->ival);
+                snprintf(irow, sizeof irow, ".gm.r%s.i", fr);
+                EV("winfo", "exists", irow);
+                if (strcmp(Tcl_GetStringResult(ui->interp), "1") == 0)
+                    EV(irow, "configure", "-text", ignored ? "Unignore" : "Ignore");
+            }
+        }
+        group_append_sys(g, 0, line);
+        if (ui->sel_kind == TT_SEL_GROUP && ui->sel_fn == g->gn)
+            hist_append_live(ui, NULL, 2, line);
+        break;
+    }
     case TT_EV_GROUP_STATE: {
         Group *g = group_by_gn(ui, e->friend_number);
         if (!g) break;
@@ -1997,8 +2162,13 @@ static void handle_event(Ui *ui, TTEvent *e) {
             if (e->str && e->str_len == TOX_GROUP_CHAT_ID_SIZE * 2)
                 memcpy(g->chat_id_hex, e->str, TOX_GROUP_CHAT_ID_SIZE * 2);
             g->chat_id_hex[TOX_GROUP_CHAT_ID_SIZE * 2] = '\0';
+            /* restore persisted group history once the chat id is known */
+            if (ui->tt->profile_path && !g->transcript[0])
+                history_load_group(ui, g);
         } else if (e->ival == -6) { /* SYNC: self role */
             g->self_role = e->ival2;
+        } else if (e->ival == -11) { /* SYNC: self peer id */
+            g->self_pid = (uint32_t)e->ival2;
         } else { /* 0..1: privacy state */
             g->privacy = e->ival;
             snprintf(line, sizeof line, "group is now %s",
@@ -2891,7 +3061,7 @@ static int cc_st_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
        friends can add you. Segments are color-coded like qTox: public key
        in the main text color, nospam in blue, checksum in gray. */
     EV("ttk::label", ".st.myl", "-text", "My ToxID (share to be added)",
-       "-foreground", C_HINT);
+       "-font", "f_bold");
     EV("tk::text", ".st.myt", "-width", "78", "-height", "1", "-wrap", "none",
        "-state", "disabled", "-font", "f_text", "-background", C_MAIN_BG,
        "-foreground", C_MAIN_TEXT, "-borderwidth", "1", "-relief", "solid");
@@ -2908,13 +3078,15 @@ static int cc_st_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
     EV("ttk::label", ".st.myn", "-text",
        "Blue = NoSpam (anti-spam), gray = checksum. Randomize to stop spam.",
        "-foreground", C_HINT);
-    EV("ttk::button", ".st.myc", "-text", "Copy", "-command", "tt_copy_id");
-    EV("ttk::button", ".st.myr", "-text", "Randomize nospam", "-command", "tt_set_nospam");
+    EV("ttk::frame", ".st.idbtns");
+    EV("ttk::button", ".st.idbtns.myc", "-text", "Copy", "-command", "tt_copy_id");
+    EV("ttk::button", ".st.idbtns.myr", "-text", "Randomize nospam", "-command", "tt_set_nospam");
     EV("ttk::separator", ".st.mys", "-orient", "horizontal");
-    EV("ttk::label", ".st.l1", "-text", "SOCKS5 proxy host (IPv4 literal, e.g. 127.0.0.1)");
+    EV("ttk::label", ".st.pl", "-text", "SOCKS5 proxy", "-font", "f_bold");
+    EV("ttk::label", ".st.l1", "-text", "Host");
     EV("ttk::entry", ".st.e1", "-width", "44");
     if (set.proxy_set) EV(".st.e1", "insert", "0", set.proxy_host);
-    EV("ttk::label", ".st.l2", "-text", "SOCKS5 proxy port");
+    EV("ttk::label", ".st.l2", "-text", "Port");
     EV("ttk::entry", ".st.e2", "-width", "10");
     if (set.proxy_set) {
         char pb[16];
@@ -2926,43 +3098,30 @@ static int cc_st_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
     EV("ttk::label", ".st.note", "-text",
        "Applies after restart. TT_PROXY_* env vars override this file.",
        "-foreground", C_HINT);
-    /* M5: verification code for the selected contact's encrypted session.
-       The code derives from the handshake root and is identical on both
-       peers — compare it out-of-band to confirm no MITM. */
-    EV("ttk::separator", ".st.sep", "-orient", "horizontal");
-    EV("ttk::label", ".st.vl", "-text", "E2EE verification code (selected contact)",
-       "-foreground", C_HINT);
-    char vcode[96];
-    Contact *vc = (ui->sel_kind == TT_SEL_CHAT) ? contact_by_fn(ui, ui->sel_fn) : NULL;
-    if (vc && vc->e2ee && vc->e2ee_code[0])
-        snprintf(vcode, sizeof vcode, "%s", vc->e2ee_code);
-    else if (vc && vc->e2ee)
-        snprintf(vcode, sizeof vcode, "(session established, code pending)");
-    else
-        snprintf(vcode, sizeof vcode, "(no encrypted session with this contact)");
-    EV("ttk::label", ".st.vc", "-text", vcode, "-foreground", C_MAIN_TEXT);
     EV("ttk::frame", ".st.b");
-    EV("ttk::button", ".st.ok", "-text", "Set", "-command", "tt_st_ok", "-style", "Green.TButton");
-    EV("ttk::button", ".st.clr", "-text", "Clear proxy", "-command", "tt_st_clear");
-    EV("ttk::button", ".st.no", "-text", "Cancel", "-command", "tt_st_cancel");
-    EV("pack", ".st.myl", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.myt", "-side", "top", "-fill", "x", "-pady", "2");
-    EV("pack", ".st.myn", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.myc", "-side", "left", "-pady", "2", "-padx", "2");
-    EV("pack", ".st.myr", "-side", "left", "-pady", "2", "-padx", "2");
-    EV("pack", ".st.mys", "-side", "top", "-fill", "x", "-pady", "6");
-    EV("pack", ".st.l1", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.e1", "-side", "top", "-fill", "x", "-pady", "2");
-    EV("pack", ".st.l2", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.e2", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.note", "-side", "top", "-anchor", "w", "-pady", "6");
-    EV("pack", ".st.sep", "-side", "top", "-fill", "x", "-pady", "6");
-    EV("pack", ".st.vl", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.vc", "-side", "top", "-anchor", "w", "-pady", "2");
-    EV("pack", ".st.ok", "-side", "right", "-pady", "8", "-padx", "4");
-    EV("pack", ".st.clr", "-side", "right", "-pady", "8", "-padx", "4");
-    EV("pack", ".st.no", "-side", "right", "-pady", "8");
-    EV("pack", ".st.b", "-side", "top", "-fill", "x");
+    EV("ttk::button", ".st.b.ok", "-text", "Set", "-command", "tt_st_ok", "-style", "Green.TButton");
+    EV("ttk::button", ".st.b.clr", "-text", "Clear proxy", "-command", "tt_st_clear");
+    EV("ttk::button", ".st.b.no", "-text", "Cancel", "-command", "tt_st_cancel");
+    /* grid layout: two columns (label | field), aligned; the ToxID buttons
+       live in their own frame so they don't crowd the proxy fields. */
+    EV("grid", ".st.myl", "-row", "0", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "2");
+    EV("grid", ".st.myt", "-row", "1", "-column", "0", "-columnspan", "2", "-sticky", "ew", "-pady", "2");
+    EV("grid", ".st.myn", "-row", "2", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "2");
+    EV("grid", ".st.idbtns", "-row", "3", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "2");
+    EV("pack", ".st.idbtns.myc", "-side", "left", "-padx", "2");
+    EV("pack", ".st.idbtns.myr", "-side", "left", "-padx", "2");
+    EV("grid", ".st.mys", "-row", "4", "-column", "0", "-columnspan", "2", "-sticky", "ew", "-pady", "6");
+    EV("grid", ".st.pl", "-row", "5", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "2");
+    EV("grid", ".st.l1", "-row", "6", "-column", "0", "-sticky", "e", "-padx", "2", "-pady", "2");
+    EV("grid", ".st.e1", "-row", "6", "-column", "1", "-sticky", "ew", "-pady", "2");
+    EV("grid", ".st.l2", "-row", "7", "-column", "0", "-sticky", "e", "-padx", "2", "-pady", "2");
+    EV("grid", ".st.e2", "-row", "7", "-column", "1", "-sticky", "w", "-pady", "2");
+    EV("grid", ".st.note", "-row", "8", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "6");
+    EV("grid", ".st.b", "-row", "9", "-column", "0", "-columnspan", "2", "-sticky", "e", "-pady", "8");
+    EV("pack", ".st.b.ok", "-side", "right", "-padx", "4");
+    EV("pack", ".st.b.clr", "-side", "right", "-padx", "4");
+    EV("pack", ".st.b.no", "-side", "right");
+    EV("grid", "columnconfigure", ".st", "1", "-weight", "1");
     EV("bind", ".st.e2", "<Return>", "tt_st_ok");
     EV("wm", "protocol", ".st", "WM_DELETE_WINDOW", "tt_st_cancel");
     EV("focus", ".st.e1");
@@ -3063,6 +3222,84 @@ static int cc_remove(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const obj
     ui->sel_fn = 0;
     roster_render(ui);
     show_selected(ui);
+    return TCL_OK;
+}
+
+/* Copy the selected friend's ToxID (public key) to the clipboard. The full
+   ToxID needs the nospam + checksum, which we do not store per-friend; the
+   stable public key is the identity a friend shares, so that is what we copy
+   (qTox's "Copy Tox ID" copies the full address; here the public key is the
+   meaningful shareable identity). */
+static int cc_copy_friend_id(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->sel_kind != TT_SEL_CHAT) return TCL_OK;
+    Contact *c = contact_by_fn(ui, ui->sel_fn);
+    if (!c || !c->pubkey_hex[0]) {
+        TT_LOG("tk", "copy friend ID: not available yet");
+        return TCL_OK;
+    }
+    EV("clipboard", "clear");
+    EV("clipboard", "append", c->pubkey_hex);
+    TT_LOG("tk", "copied friend %u public key to clipboard", c->fn);
+    return TCL_OK;
+}
+
+/* View profile: a read-only dialog showing the friend's identity details —
+   public key, last-seen, status, and the E2EE verification code. */
+static int cc_view_profile(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->sel_kind != TT_SEL_CHAT) return TCL_OK;
+    Contact *c = contact_by_fn(ui, ui->sel_fn);
+    if (!c) return TCL_OK;
+    EV("destroy", ".prof");
+    EV("toplevel", ".prof", "-padx", "14", "-pady", "14");
+    EV("wm", "title", ".prof", "Profile");
+    dlg_theme(ui, ".prof");
+    char name[TT_NAME_MAX + 32];
+    snprintf(name, sizeof name, "%s", c->name[0] ? c->name : "unknown");
+    EV("ttk::label", ".prof.name", "-text", name, "-font", "f_bold");
+    EV("pack", ".prof.name", "-side", "top", "-anchor", "w", "-pady", "2");
+    char pk[TOX_PUBLIC_KEY_SIZE * 2 + 32];
+    snprintf(pk, sizeof pk, "Public key: %s",
+             c->pubkey_hex[0] ? c->pubkey_hex : "(not available)");
+    EV("ttk::label", ".prof.pk", "-text", pk, "-wraplength", "420", "-justify", "left");
+    EV("pack", ".prof.pk", "-side", "top", "-anchor", "w", "-pady", "2");
+    char last[64];
+    if (c->last_online > 0) {
+        struct tm tmv;
+        localtime_r(&c->last_online, &tmv);
+        char buf[32];
+        strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", &tmv);
+        snprintf(last, sizeof last, "Last seen: %s", buf);
+    } else {
+        snprintf(last, sizeof last, "Last seen: never");
+    }
+    EV("ttk::label", ".prof.last", "-text", last);
+    EV("pack", ".prof.last", "-side", "top", "-anchor", "w", "-pady", "2");
+    char st[TT_NAME_MAX + 32];
+    snprintf(st, sizeof st, "Status: %s", conn_str(c->conn));
+    EV("ttk::label", ".prof.st", "-text", st);
+    EV("pack", ".prof.st", "-side", "top", "-anchor", "w", "-pady", "2");
+    /* M5: E2EE verification code for this contact's encrypted session.
+       The code derives from the handshake root and is identical on both
+       peers — compare it out-of-band to confirm no MITM. */
+    EV("ttk::separator", ".prof.sep", "-orient", "horizontal");
+    EV("pack", ".prof.sep", "-side", "top", "-fill", "x", "-pady", "6");
+    EV("ttk::label", ".prof.vl", "-text", "E2EE verification code",
+       "-foreground", C_HINT);
+    EV("pack", ".prof.vl", "-side", "top", "-anchor", "w", "-pady", "2");
+    char vcode[96];
+    if (c->e2ee && c->e2ee_code[0])
+        snprintf(vcode, sizeof vcode, "%s", c->e2ee_code);
+    else if (c->e2ee)
+        snprintf(vcode, sizeof vcode, "(session established, code pending)");
+    else
+        snprintf(vcode, sizeof vcode, "(no encrypted session with this contact)");
+    EV("ttk::label", ".prof.vc", "-text", vcode, "-foreground", C_MAIN_TEXT,
+       "-wraplength", "420", "-justify", "left");
+    EV("pack", ".prof.vc", "-side", "top", "-anchor", "w", "-pady", "2");
+    EV("ttk::button", ".prof.close", "-text", "Close", "-command", "destroy .prof");
+    EV("pack", ".prof.close", "-side", "bottom", "-pady", "8");
     return TCL_OK;
 }
 
@@ -3586,6 +3823,16 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
         snprintf(lrow, sizeof lrow, ".gm.r%s.l", fr);
         EV("ttk::label", lrow, "-text", who);
         EV("pack", lrow, "-side", "left", "-fill", "x", "-expand", "true");
+        /* Ignore/Unignore: local-only mute of a peer's messages (any role
+           can ignore; you cannot ignore yourself). */
+        if (m->pid != g->self_pid) {
+            char igcmd[48];
+            snprintf(igcmd, sizeof igcmd, "tt_gignore %s", fr);
+            snprintf(krow, sizeof krow, ".gm.r%s.i", fr);
+            EV("ttk::button", krow, "-text", m->ignored ? "Unignore" : "Ignore",
+               "-command", igcmd, "-width", "7");
+            EV("pack", krow, "-side", "right", "-padx", "2");
+        }
         /* kick/role only on peers below own role (founder > mod > user) */
         if (g->self_role <= m->role && g->self_role != TOX_GROUP_ROLE_OBSERVER &&
             m->role != TOX_GROUP_ROLE_FOUNDER) {
@@ -3640,6 +3887,21 @@ static int cc_gkick(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv
     if (!g) return TCL_OK;
     uint32_t pid = (uint32_t)strtoul(Tcl_GetString(objv[1]), NULL, 10);
     tt_queue_post(&ui->tt->in, TT_CMD_GROUP_KICK, g->gn, NULL, (int)pid);
+    return TCL_OK;
+}
+
+/* Ignore/Unignore a peer: tt_gignore <pid>. Toggles the local mute state
+   and posts the engine command; the engine confirms via IGNORE_SELF. */
+static int cc_gignore(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip;
+    if (objc < 2) return TCL_OK;
+    Group *g = gselected(ui);
+    if (!g) return TCL_OK;
+    uint32_t pid = (uint32_t)strtoul(Tcl_GetString(objv[1]), NULL, 10);
+    GroupMember *m = group_member(g, pid);
+    if (!m || pid == g->self_pid) return TCL_OK;
+    bool ignore = !m->ignored;
+    tt_queue_post2(&ui->tt->in, TT_CMD_GROUP_IGNORE, g->gn, NULL, (int)pid, ignore ? 1 : 0);
     return TCL_OK;
 }
 
@@ -3740,8 +4002,11 @@ static void build_widgets(Ui *ui) {
 
     EV("grid", ".sb.rf", "-row", "2", "-column", "0", "-sticky", "nsew");
 
-    /* roster context menu (right-click): remove friend */
+    /* roster context menu (right-click): friend actions */
     EV("menu", ".rostermenu", "-tearoff", "0");
+    EV(".rostermenu", "add", "command", "-label", "View profile", "-command", "tt_view_profile");
+    EV(".rostermenu", "add", "command", "-label", "Copy Tox ID", "-command", "tt_copy_friend_id");
+    EV(".rostermenu", "add", "separator");
     EV(".rostermenu", "add", "command", "-label", "Remove friend", "-command", "tt_remove");
     EV("bind", ".sb.rf.roster", "<Button-3>", "tt_roster_menu %x %y %X %Y");
 
@@ -3990,6 +4255,8 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_copy_id", cc_copy_id);
     bind_cmd(&g_ui, "tt_set_nospam", cc_set_nospam);
     bind_cmd(&g_ui, "tt_remove", cc_remove);
+    bind_cmd(&g_ui, "tt_copy_friend_id", cc_copy_friend_id);
+    bind_cmd(&g_ui, "tt_view_profile", cc_view_profile);
     bind_cmd(&g_ui, "tt_roster_menu", cc_roster_menu);
     bind_cmd(&g_ui, "tt_recall", cc_recall);
     bind_cmd(&g_ui, "tt_hist_resize", cc_hist_resize);
@@ -4036,6 +4303,7 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_gmembers_open", cc_gmembers_open);
     bind_cmd(&g_ui, "tt_grole", cc_grole);
     bind_cmd(&g_ui, "tt_gkick", cc_gkick);
+    bind_cmd(&g_ui, "tt_gignore", cc_gignore);
     bind_cmd(&g_ui, "tt_gleave", cc_gleave);
     bind_cmd(&g_ui, "tt_gcopy_id", cc_gcopy_id);
 
@@ -4058,6 +4326,7 @@ int ui_run(TTToxThread *tt) {
     Tk_MainLoop();
 
     TT_LOG("tk", "phase: main loop exited, cleaning up");
+    history_save(&g_ui);
     while (g_ui.contacts) contact_remove(&g_ui, g_ui.contacts);
     Tcl_DeleteInterp(g_ui.interp);
     TT_LOG("tk", "phase: cleanup done");

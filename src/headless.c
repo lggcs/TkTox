@@ -1199,6 +1199,7 @@ int bot_main(const char *profile, const char *peer_toxid) {
    messages back to the group, tracks group joins. Ctrl-C to stop. */
 int echo_main(const char *profile) {
     signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint); /* test-ui.sh kills the bot with SIGTERM */
     TTToxThread tt;
     if (!tt_tox_thread_start(&tt, profile)) {
         TT_LOG("main", "failed to start tox thread");

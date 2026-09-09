@@ -8,10 +8,10 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
-BIN=build/TkTox
-BOT_PROFILE=build/test-bot.tox
-UI_LOG=build/test-ui.log
-BOT_LOG=build/test-bot.log
+BIN=build-dyn/TkTox
+BOT_PROFILE=build-dyn/test-bot.tox
+UI_LOG=build-dyn/test-ui.log
+BOT_LOG=build-dyn/test-bot.log
 
 # Shared build/run env: computes the multiarch triplet and sets
 # PKG_CONFIG_PATH + LD_LIBRARY_PATH for the vendored .deps tree.
@@ -19,7 +19,7 @@ BOT_LOG=build/test-bot.log
 
 if [ ! -x "$BIN" ]; then
     echo "building..." >&2
-    cmake --build build --target TkTox -j4 || exit 1
+    cmake --build build-dyn --target TkTox -j4 || exit 1
 fi
 
 : > "$BOT_LOG"

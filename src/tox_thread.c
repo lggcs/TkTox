@@ -15,6 +15,7 @@
 /* used by callbacks registered long before its definition below */
 static void push_simple(TTToxThread *t, TTEventType type, uint32_t fn, const char *s, size_t len, int ival);
 static void offline_flush_friend(TTToxThread *t, uint32_t fn);
+static void emit_friend_identity(TTToxThread *t, uint32_t fn);
 
 /* ---- E2EE layer (TT_E2EE=1; session.h) ---- */
 
@@ -791,13 +792,44 @@ static void handle_cmd_file_accept(TTToxThread *t, uint32_t xfer_id, const char 
             break;
         }
     if (!x || !path) return;
-    x->fp = fopen(path, "wb");
+    /* Resume: if the destination already exists, append from its current
+       size instead of truncating. tox_file_seek tells the sender to start
+       at that offset; the existing bytes are kept (a partial download from
+       an earlier attempt). Only resume when the partial is strictly smaller
+       than the full size — a complete or oversized file is restarted. */
+    uint64_t resume_at = 0;
+    FILE *probe = fopen(path, "rb");
+    if (probe) {
+        fseek(probe, 0, SEEK_END);
+        long got = ftell(probe);
+        fclose(probe);
+        if (got > 0 && (uint64_t)got < x->size)
+            resume_at = (uint64_t)got;
+    }
+    x->fp = fopen(path, resume_at ? "r+b" : "wb");
     if (!x->fp) {
         TT_LOG("tox", "file accept: open failed: %s", path);
         Tox_Err_File_Control cerr;
         tox_file_control(t->tox, x->fn, x->file_number, TOX_FILE_CONTROL_CANCEL, &cerr);
         xfer_failed(t, x);
         return;
+    }
+    if (resume_at) {
+        if (fseek(x->fp, (long)resume_at, SEEK_SET) != 0) {
+            TT_LOG("tox", "file accept: seek failed: %s", path);
+            fclose(x->fp); x->fp = NULL;
+            Tox_Err_File_Control cerr;
+            tox_file_control(t->tox, x->fn, x->file_number, TOX_FILE_CONTROL_CANCEL, &cerr);
+            xfer_failed(t, x);
+            return;
+        }
+        x->got = resume_at;
+        x->got_prev = resume_at;
+        Tox_Err_File_Seek serr;
+        tox_file_seek(t->tox, x->fn, x->file_number, resume_at, &serr);
+        TT_LOG("tox", "file accept(%u): resuming %s at %llu/%llu (%d)",
+               xfer_id, path, (unsigned long long)resume_at,
+               (unsigned long long)x->size, (int)serr);
     }
     snprintf(x->path, sizeof x->path, "%s", path);
     x->accepted = true;
@@ -1367,6 +1399,7 @@ static void cb_friend_connection(Tox *tox, uint32_t friend_number, Tox_Connectio
     /* friend came online: offer our avatar if they don't have this hash yet,
        then flush anything queued while they were offline */
     if (connection != TOX_CONNECTION_NONE) {
+        emit_friend_identity(t, friend_number);
         avatar_push_to_friend(t, friend_number);
         if (tt_oq_count(&t->oq, friend_number) > 0 && !t->oq_flushing)
             offline_flush_friend(t, friend_number);
@@ -2026,6 +2059,27 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
                        ev->ival, TT_MOD_EV_FAIL_BASE + TOX_GROUP_MOD_EVENT_KICK);
         break;
     }
+    case TT_CMD_GROUP_IGNORE: {
+        Tox_Err_Group_Set_Ignore ierr;
+        bool ok = tox_group_set_ignore(t->tox, ev->friend_number,
+                                       (uint32_t)ev->ival, ev->ival2 != 0, &ierr);
+        TT_LOG("tox", "group ignore(%u, peer %u -> %d): %d",
+               ev->friend_number, ev->ival, ev->ival2 != 0, (int)ierr);
+        /* gc_set_ignore is local-only (no toxcore callback): confirm locally */
+        size_t ns = tox_group_peer_get_name_size(t->tox, ev->friend_number,
+                                                 (uint32_t)ev->ival, NULL);
+        char nm[TOX_MAX_NAME_LENGTH + 1] = {0};
+        if (ns > TOX_MAX_NAME_LENGTH) ns = TOX_MAX_NAME_LENGTH;
+        if (ns) tox_group_peer_get_name(t->tox, ev->friend_number, (uint32_t)ev->ival,
+                                        (uint8_t *)nm, NULL);
+        if (ok)
+            group_push(t, TT_EV_GROUP_IGNORE_SELF, ev->friend_number, nm, ns,
+                       ev->ival, ev->ival2 != 0);
+        else
+            group_push(t, TT_EV_GROUP_IGNORE_SELF, ev->friend_number, NULL, 0,
+                       ev->ival, TT_MOD_EV_FAIL_BASE + 1);
+        break;
+    }
     case TT_CMD_GROUP_SYNC: {
         /* Roster burst for the UI: peer names/roles (peer numbers are dense),
            chat id, self role, then the current topic. */
@@ -2051,6 +2105,11 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
         }
         Tox_Group_Role sr = tox_group_self_get_role(t->tox, gn, NULL);
         group_push(t, TT_EV_GROUP_STATE, gn, NULL, 0, -6, (int)sr);
+        /* self peer id (so the UI can hide self-actions like Ignore) */
+        Tox_Err_Group_Self_Query serr;
+        uint32_t self_pid = tox_group_self_get_peer_id(t->tox, gn, &serr);
+        if (serr == TOX_ERR_GROUP_SELF_QUERY_OK)
+            group_push(t, TT_EV_GROUP_STATE, gn, NULL, 0, -11, (int)self_pid);
         /* current moderation state so the owner-settings dialog opens with
            live values; -7/-8/-9 are the quiet (no transcript line) SYNC
            variants of the -1/-2/-3 change events */
@@ -2123,6 +2182,24 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
     }
 }
 
+/* Publish a friend's identity to the UI: the 64-hex public key (stable
+   identity, independent of nospam) and the last-online timestamp. Called
+   once per friend at startup and again when a friend comes online (their
+   last-online is refreshed by toxcore on reconnect). */
+static void emit_friend_identity(TTToxThread *t, uint32_t fn) {
+    uint8_t pk[TOX_PUBLIC_KEY_SIZE];
+    if (tox_friend_get_public_key(t->tox, fn, pk, NULL)) {
+        char hex[TOX_PUBLIC_KEY_SIZE * 2 + 1] = {0};
+        for (size_t i = 0; i < TOX_PUBLIC_KEY_SIZE; i++)
+            sprintf(hex + i * 2, "%02x", pk[i]); /* fixed-width, safe */
+        push_simple(t, TT_EV_FRIEND_PUBKEY, fn, hex, TOX_PUBLIC_KEY_SIZE * 2, 0);
+    }
+    Tox_Err_Friend_Get_Last_Online lerr;
+    uint64_t last = tox_friend_get_last_online(t->tox, fn, &lerr);
+    if (lerr == TOX_ERR_FRIEND_GET_LAST_ONLINE_OK && last != UINT64_MAX)
+        push_simple(t, TT_EV_FRIEND_LAST_ONLINE, fn, NULL, 0, (int)last);
+}
+
 /* Emit the initial friend list to the UI: name+connection for each loaded
    friend, then TT_EV_FRIEND_LIST_END so the UI can bind its list. */
 static void emit_initial_friend_list(TTToxThread *t) {
@@ -2151,6 +2228,7 @@ static void emit_initial_friend_list(TTToxThread *t) {
         push_simple(t, TT_EV_FRIEND_STATUS_MSG, fn, smsg, ssz2, 0);
         push_simple(t, TT_EV_FRIEND_STATUS, fn, NULL, 0,
                     (int)tox_friend_get_status(t->tox, fn, NULL));
+        emit_friend_identity(t, fn);
     }
     free(nums);
     TTEvent *ev = tt_event_new(TT_EV_FRIEND_LIST_END);
@@ -2640,7 +2718,13 @@ static void *tox_thread_main(void *arg) {
             tt_session_store_load(t->e2ee, t->profile_path, t->session_key);
             int restored = 0;
             for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++)
-                if (t->e2ee[fn].active) restored++;
+                if (t->e2ee[fn].active) {
+                    restored++;
+                    /* tell the UI about the restored session (lock badge +
+                       verification code); a fresh handshake emits this via
+                       e2ee_rx, but a restored session has no handshake */
+                    e2ee_push_state(t, fn, true);
+                }
             if (restored > 0)
                 TT_LOG("tox", "e2ee sessions restored: %d", restored);
         }

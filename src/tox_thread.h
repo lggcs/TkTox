@@ -27,6 +27,8 @@ typedef enum {
     TT_EV_FRIEND_CONNECTION,
     TT_EV_FRIEND_STATUS_MSG,
     TT_EV_FRIEND_STATUS,     /* ival: Tox_User_Status */
+    TT_EV_FRIEND_PUBKEY,     /* str: 64-hex public key (friend identity) */
+    TT_EV_FRIEND_LAST_ONLINE,/* ival: unix time the friend was last seen online */
     TT_EV_FRIEND_REQUEST,
     TT_EV_FRIEND_LIST_END,
     TT_EV_AVATAR_SELF,       /* str: self avatar PNG bytes; empty = cleared */
@@ -54,6 +56,7 @@ typedef enum {
     TT_EV_GROUP_STATE,       /* group; encoded in ival: 0..1 privacy, -1 ival2=voice, -2 ival2=topic lock, -3 ival2=peer limit (str=count), -4 password changed */
     TT_EV_GROUP_JOIN_FAIL,   /* group, ival: Tox_Group_Join_Fail */
     TT_EV_GROUP_MOD_SELF,    /* actor-side moderation feedback (no toxcore callback fires for the actor); ival: target peer id, ival2: Tox_Group_Mod_Event, or TT_MOD_EV_FAIL_BASE+<event> on failure; str: target name */
+    TT_EV_GROUP_IGNORE_SELF, /* actor-side ignore feedback (gc_set_ignore is local-only, no callback); ival: target peer id, ival2: 0 unignored / 1 ignored, or TT_MOD_EV_FAIL_BASE+1 on failure; str: target name */
     TT_EV_OFFLINE_FLUSHED,   /* friend_number, ival: count delivered (UI renders the per-contact system line) */
     TT_EV_FRIEND_TYPING,     /* friend_number, ival: 0 stopped / 1 typing */
     TT_EV_FRIEND_READ_RECEIPT, /* friend_number, ival: last read message id */
@@ -107,6 +110,7 @@ typedef enum {
     TT_CMD_GROUP_PEER_LIMIT, /* group, ival2: peer limit */
     TT_CMD_GROUP_ROLE,       /* group, ival: peer id, ival2: Tox_Group_Role */
     TT_CMD_GROUP_KICK,       /* group, ival: peer id */
+    TT_CMD_GROUP_IGNORE,     /* group, ival: peer id, ival2: 0 unignore / 1 ignore */
     TT_CMD_GROUP_SYNC,       /* group: pushes a roster burst (see below) */
     TT_CMD_SET_TYPING,       /* friend_number, ival: 0/1 */
     TT_CMD_FILE_CANCEL,      /* ival: xfer id (active transfer, either direction) */

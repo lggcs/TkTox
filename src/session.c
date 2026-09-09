@@ -310,10 +310,15 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
            to the peer's INIT (stashed texts survive), the lower side
            ignores the peer's INIT and keeps waiting for the REPLY. The
            gate covers init_pending too: INITs can cross before either
-           side is active. */
+           side is active.
+           Established-session case: if we are ACTIVE and the peer sends a
+           fresh INIT, the peer has lost its session (it is re-initiating)
+           — yield and re-establish as responder regardless of pk, or the
+           two sides wedge forever (one restored a session the other lost). */
         if (s->i_am_initiator && (s->active || s->init_pending)) {
-            if (memcmp(d.hdr, env->self_pk, TT_KEY32) < 0) {
-                /* peer is the lower pk: yield, re-run as responder */
+            if (s->active || memcmp(d.hdr, env->self_pk, TT_KEY32) < 0) {
+                /* peer is the lower pk (or we are established): yield,
+                   re-run as responder */
                 uint8_t stash[sizeof s->pending];
                 uint8_t np = s->n_pending;
                 memcpy(stash, s->pending, sizeof stash);

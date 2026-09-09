@@ -102,6 +102,7 @@ set(TT_SOURCES
   src/audio_alsa.c
   src/video_v4l2.c
   src/offline_queue.c
+  src/history.c
   src/session_store.c
   src/app_state.c
   src/log.c
