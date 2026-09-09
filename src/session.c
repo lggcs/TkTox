@@ -1,0 +1,639 @@
+#include "session.h"
+
+#include <sodium.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static bool sodium_ready;
+
+static void sodium_init_once(void) {
+    if (!sodium_ready) {
+        if (sodium_init() < 0) return;
+        sodium_ready = true;
+    }
+}
+
+bool tt_e2ee_init_mode(void) { return getenv("TT_E2EE") != NULL; }
+
+/* ---- local helpers (crypto.h stays primitive-only) ---- */
+
+/* KDF(root, label): ikm = root(32) || 0x01, ctx = label. The 0x01 byte is
+   a fixed-length separator (root is always 32B). */
+static void derive_from_root(uint8_t out[TT_KEY32], const uint8_t root[TT_KEY32],
+                             const char *label) {
+    uint8_t ikm[TT_KEY32 + 1];
+    memcpy(ikm, root, TT_KEY32);
+    ikm[TT_KEY32] = 0x01;
+    tt_kdf_root(out, ikm, sizeof ikm, (const uint8_t *)label, strlen(label));
+    sodium_memzero(ikm, sizeof ikm);
+}
+
+/* INIT/REPLY seal key = one DH leg of the handshake, domain-separated:
+   INIT  seals under dh2 = DH(ephA2_sk, IKb)   (initiator precomputes)
+   REPLY seals under dh1 = DH(ephB1_sk, IKa)   (responder precomputes)
+   The peer opens with the mirrored DH; a MITM without a Tox secret key can
+   compute neither. ad = "tt-e2ee-seal" (12B fixed) || ad_ik (32B), where
+   ad_ik is the identity key of the STATIC party of the leg (INIT: IKb,
+   REPLY: IKa) — the sealer passes it as its DH peer, the opener as its own
+   self_pk. */
+static int seal_key_derive(uint8_t out[TT_KEY32], const uint8_t sk[TT_KEY32],
+                           const uint8_t dh_peer[TT_KEY32],
+                           const uint8_t ad_ik[TT_KEY32]) {
+    uint8_t ss[TT_KEY32], ad[12 + TT_KEY32];
+    if (tt_dh_shared(ss, sk, dh_peer) != 0) return -1;
+    memcpy(ad, "tt-e2ee-seal", 12);
+    memcpy(ad + 12, ad_ik, TT_KEY32);
+    tt_kdf_root(out, ss, TT_KEY32, ad, sizeof ad);
+    sodium_memzero(ss, sizeof ss);
+    return 0;
+}
+
+/* ---- M4 ratchet (PQDR-style; both DH and KEM fold every re-key) ---- */
+
+/* fresh ratchet state from the handshake root; chain seeds from it */
+static void ratchet_reset(TTRatchet *r, const uint8_t root[TT_KEY32],
+                          bool initiator_dir) {
+    sodium_memzero(r, sizeof *r);
+    memcpy(r->root, root, TT_KEY32);
+    derive_from_root(r->chain, root, initiator_dir ? "tt-e2ee-i" : "tt-e2ee-r");
+    r->seq = 1;
+    r->since_fold = 0;
+}
+
+/* one ratchet fold: root' = KDF(root || DH_out || KEM_secret) — PQ material
+   in EVERY root step (the property libsignal's PQXDH lacks); the chain
+   re-seeds from the NEW root. seq CONTINUES (a restart would make pre-fold
+   frames indistinguishable from reordered post-fold frames, so old frames
+   are rejected as replay); skipped keys from the old chain are invalid. */
+static void ratchet_fold(TTRatchet *r, const uint8_t dh[TT_KEY32],
+                         const uint8_t kem[TT_KEY32]) {
+    uint8_t new_root[TT_KEY32], new_chain[TT_KEY32];
+    tt_kdf_root_step(new_root, new_chain, r->root, dh, kem);
+    memcpy(r->root, new_root, TT_KEY32);
+    memcpy(r->chain, new_chain, TT_KEY32);
+    sodium_memzero(new_root, sizeof new_root);
+    sodium_memzero(new_chain, sizeof new_chain);
+    r->since_fold = 0;
+    r->n_skipped = 0;
+}
+
+/* msg key + nonce for the sender's next seq; consumes one chain step */
+static void send_key(TTRatchet *r, uint32_t *seq, uint8_t key[TT_KEY32],
+                     uint8_t nonce[TT_NONCE24]) {
+    uint8_t mk[TT_KEY32], nc[TT_KEY32];
+    tt_kdf_chain_step(nc, mk, r->chain);
+    memcpy(r->chain, nc, TT_KEY32);
+    sodium_memzero(nc, sizeof nc);
+    tt_kdf_msg_material(key, nonce, mk);
+    sodium_memzero(mk, sizeof mk);
+    *seq = r->seq;
+    r->seq++;
+}
+
+/* msg key + nonce for `seq` (>= r->seq) from a scratch copy of the chain,
+   WITHOUT committing — the caller commits only after a successful decrypt. */
+static void msg_key_at(const TTRatchet *r, uint32_t seq, uint8_t key[TT_KEY32],
+                       uint8_t nonce[TT_NONCE24]) {
+    uint8_t c[TT_KEY32], mk[TT_KEY32], nc[TT_KEY32];
+    memcpy(c, r->chain, TT_KEY32);
+    for (uint32_t k = r->seq; k < seq; k++) {
+        tt_kdf_chain_step(nc, mk, c);
+        memcpy(c, nc, TT_KEY32);
+    }
+    tt_kdf_chain_step(nc, mk, c);
+    tt_kdf_msg_material(key, nonce, mk);
+    sodium_memzero(c, sizeof c);
+    sodium_memzero(mk, sizeof mk);
+    sodium_memzero(nc, sizeof nc);
+}
+
+/* skipped-key ring ops (out-of-order delivery) */
+static void skipped_add(TTRatchet *r, uint32_t seq, const uint8_t key[TT_KEY32]) {
+    if (r->n_skipped >= TT_SESSION_SKIPPED_MAX) {
+        memmove(&r->skipped[0], &r->skipped[1],
+                (TT_SESSION_SKIPPED_MAX - 1) * sizeof r->skipped[0]);
+        r->n_skipped--;
+    }
+    r->skipped[r->n_skipped].seq = seq;
+    memcpy(r->skipped[r->n_skipped].key, key, TT_KEY32);
+    r->n_skipped++;
+}
+
+static int skipped_take(TTRatchet *r, uint32_t seq, uint8_t key[TT_KEY32]) {
+    for (int i = 0; i < r->n_skipped; i++) {
+        if (r->skipped[i].seq == seq) {
+            memcpy(key, r->skipped[i].key, TT_KEY32);
+            sodium_memzero(r->skipped[i].key, TT_KEY32);
+            for (int k = i + 1; k < r->n_skipped; k++)
+                r->skipped[k - 1] = r->skipped[k];
+            r->n_skipped--;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void tt_session_init(TTSession *s) { memset(s, 0, sizeof *s); }
+
+void tt_session_clear(TTSession *s) { sodium_memzero(s, sizeof *s); }
+
+/* verification code from the HANDSHAKE ROOT (direction-independent, so
+   both peers derive the same 32 hex chars; stays stable while M4 ratchet
+   advances re-key the per-direction roots) */
+bool tt_session_verify_code(const TTSession *s, char out[33]) {
+    if (!s->active) return false;
+    uint8_t vc[TT_KEY32];
+    derive_from_root(vc, s->root, "tt-e2ee-vcode");
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i * 2] = hex[vc[i] >> 4];
+        out[i * 2 + 1] = hex[vc[i] & 0x0f];
+    }
+    out[32] = '\0';
+    sodium_memzero(vc, sizeof vc);
+    return true;
+}
+
+/* session root from the three DH legs + KEM secret, then per-direction
+   ratchet roots (M4). ctx = "tt-e2ee-root:" (13B) || IKa || IKb. The chain
+   label is per message-flow direction relative to the initiator: the
+   initiator->responder direction uses "tt-e2ee-i", responder->initiator
+   uses "tt-e2ee-r" — so the initiator's send matches the responder's recv
+   and vice versa. */
+static void establish(TTSession *s, const uint8_t f1[TT_KEY32],
+                      const uint8_t f2[TT_KEY32], const uint8_t f3[TT_KEY32],
+                      const uint8_t kem_ss[TT_KEY32],
+                      const uint8_t IKa[TT_KEY32], const uint8_t IKb[TT_KEY32],
+                      bool i_am_initiator) {
+    uint8_t ikm[TT_IKM128], ctx[13 + 2 * TT_KEY32];
+    memcpy(ikm, f1, TT_KEY32);
+    memcpy(ikm + 32, f2, TT_KEY32);
+    memcpy(ikm + 64, f3, TT_KEY32);
+    memcpy(ikm + 96, kem_ss, TT_KEY32);
+    memcpy(ctx, "tt-e2ee-root:", 13);
+    memcpy(ctx + 13, IKa, TT_KEY32);
+    memcpy(ctx + 13 + TT_KEY32, IKb, TT_KEY32);
+    tt_kdf_root(s->root, ikm, TT_IKM128, ctx, sizeof ctx);
+    sodium_memzero(ikm, sizeof ikm);
+    sodium_memzero(ctx, sizeof ctx);
+    /* M4: per-direction ratchet roots + fresh re-key material; chains seed
+       from the direction roots, seq starts at 1 */
+    if (i_am_initiator) {
+        ratchet_reset(&s->send, s->root, true);  /* send = "i" */
+        ratchet_reset(&s->recv, s->root, false); /* recv = "r" */
+    } else {
+        ratchet_reset(&s->send, s->root, false); /* send = "r" */
+        ratchet_reset(&s->recv, s->root, true);  /* recv = "i" */
+    }
+    /* one re-key keypair set, shared across both directions */
+    tt_dh_keygen(s->rekey.eph_pk, s->rekey.eph_sk);
+    tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
+    s->rekey.have_kem = true;
+}
+
+/* ---- INIT (initiator) ---- */
+
+static int build_init(TTSession *s, const TTE2EEEnv *env, uint8_t *out,
+                      size_t cap) {
+    uint8_t hdr[TT_HDR_INIT], nonce[TT_NONCE24];
+    memcpy(hdr, env->self_pk, TT_KEY32);                 /* IKa claim */
+    memcpy(hdr + 32, s->eph_a2_pk, TT_KEY32);            /* dh2 leg */
+    memcpy(hdr + 64, s->eph_a3_pk, TT_KEY32);            /* dh3 leg */
+    memcpy(hdr + TT_SESSION_HDR_KEM, s->kem_pk, TT_KEM_PK);
+    randombytes_buf(nonce, sizeof nonce);
+    int n = tt_frame_encode(out, cap, TT_FRAME_INIT, 0, TT_FRAME_FLAG_KEM,
+                            s->init_seal, nonce, hdr, TT_HDR_INIT, NULL, 0);
+    sodium_memzero(nonce, sizeof nonce);
+    sodium_memzero(hdr, sizeof hdr);
+    return n;
+}
+
+int tt_session_start(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t cap) {
+    sodium_init_once();
+    if (!env->self_sk || !env->self_pk || !env->peer_pk) return TT_E2EE_NOKEY;
+
+    /* reset any stale state but keep stashed texts (typed while a previous
+       handshake was pending) — they flush over the new session */
+    uint8_t stash[sizeof s->pending];
+    uint8_t np = s->n_pending;
+    memcpy(stash, s->pending, sizeof stash);
+    tt_session_clear(s);
+    memcpy(s->pending, stash, sizeof stash);
+    s->n_pending = np;
+    s->i_am_initiator = true;
+    s->init_pending = true;
+    s->init_at = time(NULL);
+    tt_dh_keygen(s->eph_a2_pk, s->eph_a2_sk);
+    tt_dh_keygen(s->eph_a3_pk, s->eph_a3_sk);
+    tt_kem_keygen(s->kem_pk, s->kem_sk);
+    /* INIT seal key = dh2 = DH(ephA2, IKb); AD labels the static party IKb */
+    if (seal_key_derive(s->init_seal, s->eph_a2_sk, env->peer_pk, env->peer_pk) != 0)
+        return TT_E2EE_BAD_ID;
+    int n = build_init(s, env, out, cap);
+    return n > 0 ? n : TT_E2EE_BAD_STATE;
+}
+
+/* ---- REPLY (responder) ---- */
+
+int tt_session_reply(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t cap) {
+    sodium_init_once();
+    if (!env->self_sk || !env->self_pk || !env->peer_pk) return TT_E2EE_NOKEY;
+    /* retransmit-driven re-send of an already-built REPLY (the INIT was a
+       duplicate); no state changes */
+    if (!s->reply_due) {
+        if (s->reply_cache_len > 0) {
+            if (cap < s->reply_cache_len) return TT_E2EE_BAD_STATE;
+            memcpy(out, s->reply_cache, s->reply_cache_len);
+            return s->reply_cache_len;
+        }
+        return TT_E2EE_BAD_STATE;
+    }
+    s->reply_due = false;
+
+    /* first REPLY build: ephB1/ephB3 sks + kem_ct were set by feed() */
+    uint8_t hdr[TT_HDR_REPLY], nonce[TT_NONCE24], key[TT_KEY32];
+    memcpy(hdr, env->self_pk, TT_KEY32);                 /* IKb claim */
+    memcpy(hdr + 32, s->eph_b1_pk, TT_KEY32);
+    memcpy(hdr + 64, s->eph_b3_pk, TT_KEY32);
+    memcpy(hdr + TT_SESSION_HDR_KEM, s->kem_ct, TT_KEM_CT);
+    /* REPLY seal key = dh1 = DH(ephB1, IKa); static party = IKa (the peer) */
+    if (seal_key_derive(key, s->eph_b1_sk, env->peer_pk, env->peer_pk) != 0)
+        return TT_E2EE_BAD_ID;
+    randombytes_buf(nonce, sizeof nonce);
+    int n = tt_frame_encode(out, cap, TT_FRAME_REPLY, 0, TT_FRAME_FLAG_KEM,
+                            key, nonce, hdr, TT_HDR_REPLY, NULL, 0);
+    sodium_memzero(key, sizeof key);
+    sodium_memzero(nonce, sizeof nonce);
+    sodium_memzero(hdr, sizeof hdr);
+    if (n < 0) return TT_E2EE_BAD_STATE;
+    memcpy(s->reply_cache, out, (size_t)n);
+    s->reply_cache_len = (uint16_t)n;
+    return n;
+}
+
+/* ---- receive ---- */
+
+int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
+                    size_t in_len, uint8_t *pt, size_t pt_cap, bool *handshaked) {
+    sodium_init_once();
+    *handshaked = false;
+    TTFrameDesc d;
+    if (tt_frame_peek(in, in_len, &d) != 0) return TT_E2EE_DECODE_FAIL;
+    if (d.type == TT_FRAME_DATA) { /* M4 harness hook: keep for replay */
+        if (in_len <= sizeof s->last_in) {
+            memcpy(s->last_in, in, in_len);
+            s->last_in_len = (uint16_t)in_len;
+        }
+    }
+
+    if (d.type == TT_FRAME_INIT) {
+        if (d.hdr_len != TT_HDR_INIT) return TT_E2EE_DECODE_FAIL;
+        if (!env->peer_pk || memcmp(d.hdr, env->peer_pk, TT_KEY32) != 0)
+            return TT_E2EE_BAD_ID; /* claimed IK must be the friend's */
+
+        /* INIT retransmit of the session we already accepted? */
+        if (s->active && !s->i_am_initiator) {
+            uint8_t key0[TT_KEY32], scratch[16];
+            TTFrameDesc dd;
+            if (seal_key_derive(key0, env->self_sk, d.hdr + 32, env->self_pk) == 0 &&
+                tt_frame_decode(in, in_len, key0, &dd, scratch,
+                                sizeof scratch) == 0 &&
+                dd.seq == 0) {
+                *handshaked = true; /* engine resends reply_cache */
+            }
+            sodium_memzero(key0, sizeof key0);
+            if (*handshaked) return 0;
+        }
+        /* simultaneous-initiator collision: the LOWER identity pk wins the
+           initiator role — the higher side clears and re-runs as responder
+           to the peer's INIT (stashed texts survive), the lower side
+           ignores the peer's INIT and keeps waiting for the REPLY. The
+           gate covers init_pending too: INITs can cross before either
+           side is active. */
+        if (s->i_am_initiator && (s->active || s->init_pending)) {
+            if (memcmp(d.hdr, env->self_pk, TT_KEY32) < 0) {
+                /* peer is the lower pk: yield, re-run as responder */
+                uint8_t stash[sizeof s->pending];
+                uint8_t np = s->n_pending;
+                memcpy(stash, s->pending, sizeof stash);
+                tt_session_clear(s);
+                memcpy(s->pending, stash, sizeof stash);
+                s->n_pending = np;
+            } else {
+                return 0; /* lower pk: our INIT carries the session */
+            }
+        }
+
+        /* fresh INIT: open with dh2 = DH(IKb_sk, ephA2), AD labels IKb */
+        uint8_t key[TT_KEY32], scratch[16];
+        if (seal_key_derive(key, env->self_sk, d.hdr + 32, env->self_pk) != 0)
+            return TT_E2EE_BAD_ID;
+        int n = tt_frame_decode(in, in_len, key, &d, scratch, sizeof scratch);
+        if (n < 0) {
+            sodium_memzero(key, sizeof key);
+            return TT_E2EE_DECODE_FAIL;
+        }
+        /* keep the seal key for INIT-retransmit detection */
+        memcpy(s->init_seal, key, TT_KEY32);
+        sodium_memzero(key, sizeof key);
+
+        /* responder scratch + KEM encapsulation */
+        tt_dh_keygen(s->eph_b1_pk, s->eph_b1_sk);
+        tt_dh_keygen(s->eph_b3_pk, s->eph_b3_sk);
+        uint8_t ss[TT_KEY32];
+        tt_kem_enc(s->kem_ct, ss, d.hdr + TT_SESSION_HDR_KEM);
+        /* dh1 = DH(ephB1, IKa), dh2 = DH(IKb, ephA2), dh3 = DH(ephB3, ephA3) */
+        uint8_t f1[TT_KEY32], f2[TT_KEY32], f3[TT_KEY32];
+        int rc = 0;
+        if (tt_dh_shared(f1, s->eph_b1_sk, env->peer_pk) != 0) rc = -1;
+        if (rc == 0 && tt_dh_shared(f2, env->self_sk, d.hdr + 32) != 0) rc = -1;
+        if (rc == 0 && tt_dh_shared(f3, s->eph_b3_sk, d.hdr + 64) != 0) rc = -1;
+        if (rc != 0) {
+            sodium_memzero(ss, sizeof ss);
+            return TT_E2EE_BAD_ID;
+        }
+        establish(s, f1, f2, f3, ss, env->peer_pk, env->self_pk, false);
+        sodium_memzero(f1, sizeof f1);
+        sodium_memzero(f2, sizeof f2);
+        sodium_memzero(f3, sizeof f3);
+        sodium_memzero(ss, sizeof ss);
+        s->i_am_initiator = false;
+        s->active = true;
+        s->reply_due = true;
+        s->init_pending = false;
+        *handshaked = true;
+        return 0;
+    }
+
+    if (d.type == TT_FRAME_REPLY) {
+        if (!s->init_pending || s->active) return 0; /* dup/late REPLY */
+        if (d.hdr_len != TT_HDR_REPLY) return TT_E2EE_DECODE_FAIL;
+        if (!env->peer_pk || memcmp(d.hdr, env->peer_pk, TT_KEY32) != 0)
+            return TT_E2EE_BAD_ID;
+        /* open with dh1 = DH(IKa_sk, ephB1), AD labels IKa */
+        uint8_t key[TT_KEY32], scratch[16];
+        if (seal_key_derive(key, env->self_sk, d.hdr + 32, env->self_pk) != 0)
+            return TT_E2EE_BAD_ID;
+        int n = tt_frame_decode(in, in_len, key, &d, scratch, sizeof scratch);
+        sodium_memzero(key, sizeof key);
+        if (n < 0) return TT_E2EE_DECODE_FAIL;
+        /* dh1 = DH(IKa, ephB1), dh2 = DH(ephA2, IKb), dh3 = DH(ephA3, ephB3) */
+        uint8_t f1[TT_KEY32], f2[TT_KEY32], f3[TT_KEY32], ss[TT_KEY32];
+        int rc = 0;
+        if (tt_dh_shared(f1, env->self_sk, d.hdr + 32) != 0) rc = -1;
+        if (rc == 0 && tt_dh_shared(f2, s->eph_a2_sk, env->peer_pk) != 0) rc = -1;
+        if (rc == 0 && tt_dh_shared(f3, s->eph_a3_sk, d.hdr + 64) != 0) rc = -1;
+        if (rc != 0) return TT_E2EE_BAD_ID;
+        tt_kem_dec(ss, d.hdr + TT_SESSION_HDR_KEM, s->kem_sk);
+        establish(s, f1, f2, f3, ss, env->self_pk, env->peer_pk, true);
+        sodium_memzero(f1, sizeof f1);
+        sodium_memzero(f2, sizeof f2);
+        sodium_memzero(f3, sizeof f3);
+        sodium_memzero(ss, sizeof ss);
+        s->init_pending = false;
+        s->i_am_initiator = true;
+        s->active = true;
+        *handshaked = true;
+        return 0;
+    }
+
+    /* ---- DATA (M4 ratchet receive) ---- */
+    if (!s->active) return TT_E2EE_NO_SESSION;
+    if (d.hdr_len != 0 && d.hdr_len != TT_HDR_DATA_REKEY &&
+        d.hdr_len != TT_HDR_DATA_KEMPUB)
+        return TT_E2EE_DECODE_FAIL;
+
+    /* derive the msg key WITHOUT committing chain state (receive hygiene:
+       a corrupt/replayed frame must not consume the chain) */
+    uint8_t key[TT_KEY32], nonce[TT_NONCE24];
+    bool from_ring = false;
+    if (d.seq == s->recv.seq) {
+        msg_key_at(&s->recv, d.seq, key, nonce);
+    } else if (d.seq > s->recv.seq) {
+        if (d.seq - s->recv.seq >= TT_SESSION_MAX_SKIP)
+            return TT_E2EE_SEQ_TOO_OLD;
+        msg_key_at(&s->recv, d.seq, key, nonce);
+    } else {
+        if (skipped_take(&s->recv, d.seq, key) != 0)
+            return TT_E2EE_REPLAY;
+        from_ring = true;
+    }
+
+    int n = tt_frame_decode(in, in_len, key, &d, pt, pt_cap);
+    if (n < 0) {
+        sodium_memzero(key, sizeof key);
+        sodium_memzero(nonce, sizeof nonce);
+        if (from_ring) skipped_add(&s->recv, d.seq, key); /* restore */
+        return TT_E2EE_DECODE_FAIL;
+    }
+
+    /* commit the chain advance (in-order or skip): store skipped keys for
+       the gap, then advance past d.seq */
+    if (!from_ring) {
+        while (s->recv.seq < d.seq) {
+            uint8_t mk[TT_KEY32], nc[TT_KEY32], ek[TT_KEY32], nz[TT_NONCE24];
+            tt_kdf_chain_step(nc, mk, s->recv.chain);
+            memcpy(s->recv.chain, nc, TT_KEY32);
+            tt_kdf_msg_material(ek, nz, mk);
+            skipped_add(&s->recv, s->recv.seq, ek);
+            s->recv.seq++;
+        }
+        uint8_t mk[TT_KEY32], nc[TT_KEY32];
+        tt_kdf_chain_step(nc, mk, s->recv.chain);
+        memcpy(s->recv.chain, nc, TT_KEY32);
+        s->recv.seq++;
+    }
+
+    /* apply re-key material (after decrypt; the REKEY frame itself was
+       encrypted under the pre-fold key) */
+    if (d.hdr_len == TT_HDR_DATA_REKEY) {
+        uint8_t ss[TT_KEY32], dh[TT_KEY32];
+        tt_kem_dec(ss, d.hdr, s->rekey.kem_sk);
+        tt_dh_shared(dh, s->rekey.eph_sk, d.hdr + TT_HDR_DATA_DH_OFF);
+        ratchet_fold(&s->recv, dh, ss);
+        memcpy(s->rekey.peer_eph_pk, d.hdr + TT_HDR_DATA_DH_OFF, TT_KEY32);
+        sodium_memzero(ss, sizeof ss);
+        sodium_memzero(dh, sizeof dh);
+    } else if (d.hdr_len == TT_HDR_DATA_KEMPUB) {
+        memcpy(s->rekey.peer_kem_pk, d.hdr, TT_KEM_PK);
+        memcpy(s->rekey.peer_eph_pk, d.hdr + TT_KEM_PK, TT_KEY32);
+        s->rekey.peer_have = true;
+        if (s->rekey.awaiting_peer) {
+            /* we published and were waiting: now we can fold our direction */
+            s->rekey.awaiting_peer = false;
+            s->rekey.rekey_due = true;
+        } else if (s->rekey.have_kem && !s->rekey.published) {
+            /* publish ours back so the peer can fold its direction */
+            s->rekey.publish_back = true;
+        }
+    }
+
+    sodium_memzero(key, sizeof key);
+    sodium_memzero(nonce, sizeof nonce);
+    return n;
+}
+
+/* ---- send ---- */
+
+/* encrypt one text into a DATA frame; when a re-key is due, the M4 re-key
+   hdr rides along: REKEY (fold our send direction) when the peer's keys
+   are on file, otherwise a publish-only KEMPUB goes out first. */
+static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
+                      uint8_t *out, size_t cap) {
+    uint8_t key[TT_KEY32], nonce[TT_NONCE24];
+    uint8_t flags = tt_aead_gcm_available()
+                        ? (uint8_t)(TT_FRAME_FLAG_GCM | TT_FRAME_FLAG_AES_HW)
+                        : 0u;
+    uint8_t hdr[TT_HDR_DATA_KEMPUB]; /* largest DATA hdr */
+    size_t hdr_len = 0;
+    bool do_fold = false;
+    uint8_t fold_dh[TT_KEY32], fold_ss[TT_KEY32];
+
+    /* auto-re-key trigger (every TT_SESSION_REKEY_EVERY frames); does not
+       re-fire while we are already waiting for the peer's keys */
+    if (!s->rekey.awaiting_peer && s->send.since_fold >= TT_SESSION_REKEY_EVERY)
+        s->rekey.rekey_due = true;
+
+    if (s->rekey.rekey_due && s->rekey.peer_have) {
+        /* REKEY: fold our send direction after encrypting */
+        tt_kem_enc(hdr, fold_ss, s->rekey.peer_kem_pk);
+        tt_dh_shared(fold_dh, s->rekey.eph_sk, s->rekey.peer_eph_pk);
+        memcpy(hdr + TT_HDR_DATA_DH_OFF, s->rekey.eph_pk, TT_KEY32);
+        hdr_len = TT_HDR_DATA_REKEY;
+        flags |= TT_FRAME_FLAG_KEM | TT_FRAME_FLAG_PK;
+        do_fold = true;
+    } else if (s->rekey.rekey_due && !s->rekey.awaiting_peer) {
+        /* publish our keys first (peer does not have them yet) */
+        if (!s->rekey.have_kem) {
+            tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
+            s->rekey.have_kem = true;
+        }
+        memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
+        memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
+        hdr_len = TT_HDR_DATA_KEMPUB;
+        flags |= TT_FRAME_FLAG_PK;
+        s->rekey.published = true;
+        s->rekey.awaiting_peer = true;
+        s->rekey.rekey_due = false; /* fold completes when the peer's keys land */
+    } else if (s->rekey.post_fold_publish) {
+        /* publish our regenerated keys so the peer can re-key its direction */
+        memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
+        memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
+        hdr_len = TT_HDR_DATA_KEMPUB;
+        flags |= TT_FRAME_FLAG_PK;
+        s->rekey.published = true;
+        s->rekey.post_fold_publish = false;
+    } else if (s->rekey.publish_back) {
+        /* peer published its keys; publish ours back so it can fold */
+        memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
+        memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
+        hdr_len = TT_HDR_DATA_KEMPUB;
+        flags |= TT_FRAME_FLAG_PK;
+        s->rekey.published = true;
+        s->rekey.publish_back = false;
+    }
+
+    uint32_t seq;
+    send_key(&s->send, &seq, key, nonce);
+    int n = tt_frame_encode(out, cap, TT_FRAME_DATA, seq, flags, key, nonce,
+                            hdr_len ? hdr : NULL, hdr_len, text, len);
+    sodium_memzero(key, sizeof key);
+    sodium_memzero(nonce, sizeof nonce);
+    sodium_memzero(hdr, sizeof hdr);
+    if (n < 0) return TT_E2EE_BAD_STATE;
+
+    if (do_fold) {
+        ratchet_fold(&s->send, fold_dh, fold_ss);
+        /* regenerate our keys and publish them next frame */
+        tt_dh_keygen(s->rekey.eph_pk, s->rekey.eph_sk);
+        tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
+        s->rekey.have_kem = true;
+        s->rekey.published = false;
+        s->rekey.post_fold_publish = true;
+        s->rekey.rekey_due = false;
+        s->send.since_fold = 0;
+        sodium_memzero(fold_dh, sizeof fold_dh);
+        sodium_memzero(fold_ss, sizeof fold_ss);
+    } else {
+        s->send.since_fold++;
+    }
+    return n;
+}
+
+int tt_session_send(TTSession *s, const TTE2EEEnv *env, const uint8_t *text,
+                    size_t len, uint8_t *out, size_t cap) {
+    (void)env;
+    if (len > TT_FRAME_DATA_MAX) return TT_E2EE_BAD_STATE;
+    if (!s->active) {
+        if (s->n_pending >= TT_SESSION_PENDING_MAX) return TT_E2EE_BUSY;
+        if (len > 0) {
+            memcpy(s->pending[s->n_pending].data, text, len);
+            s->pending[s->n_pending].len = (uint16_t)len;
+            s->n_pending++;
+        }
+        return 0;
+    }
+    return emit_frame(s, text, len, out, cap);
+}
+
+int tt_session_flush(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t cap) {
+    (void)env;
+    if (!s->active || s->n_pending == 0) return 0;
+    int n = emit_frame(s, s->pending[0].data, s->pending[0].len, out, cap);
+    if (n <= 0) return n;
+    sodium_memzero(s->pending[0].data, sizeof s->pending[0].data);
+    for (int i = 1; i < s->n_pending; i++) s->pending[i - 1] = s->pending[i];
+    s->n_pending--;
+    return n;
+}
+
+/* ---- tick: INIT retransmit ---- */
+
+int tt_session_tick(TTSession *s, const TTE2EEEnv *env, time_t now, uint8_t *out,
+                    size_t cap) {
+    if (!s->init_pending) return 0;
+    if (now - s->init_at < 5) return 0;
+    s->init_at = now;
+    int n = build_init(s, env, out, cap);
+    return n > 0 ? n : 0;
+}
+
+/* ---- M4 ratchet engine hooks ---- */
+
+void tt_session_rekey_due(TTSession *s) {
+    if (!s->active) return;
+    s->rekey.rekey_due = true;
+}
+
+/* ---- M4 harness hooks (TT_BOT_E2EE reorder/replay modes) ---- */
+
+/* build the DATA frame for `seq` ("m<N>") WITHOUT committing any send
+   state, so the engine can deliver frames out of order (reorder mode). */
+int tt_session_frame_at(TTSession *s, const TTE2EEEnv *env, uint32_t seq,
+                        uint8_t *out, size_t cap) {
+    (void)env;
+    if (!s->active) return TT_E2EE_NO_SESSION;
+    uint8_t key[TT_KEY32], nonce[TT_NONCE24];
+    msg_key_at(&s->send, seq, key, nonce);
+    char text[16];
+    int tl = snprintf(text, sizeof text, "m%u", (unsigned)seq);
+    uint8_t flags = tt_aead_gcm_available()
+                        ? (uint8_t)(TT_FRAME_FLAG_GCM | TT_FRAME_FLAG_AES_HW)
+                        : 0u;
+    int n = tt_frame_encode(out, cap, TT_FRAME_DATA, seq, flags, key, nonce,
+                            NULL, 0, (const uint8_t *)text, (size_t)tl);
+    sodium_memzero(key, sizeof key);
+    sodium_memzero(nonce, sizeof nonce);
+    return n;
+}
+
+/* copy the LAST incoming DATA frame for a re-inject (replay mode) */
+int tt_session_inject_older(TTSession *s, const TTE2EEEnv *env, uint8_t *out,
+                            size_t cap) {
+    (void)env;
+    if (!s->active) return TT_E2EE_NO_SESSION;
+    if (s->last_in_len == 0 || s->last_in_len > cap) return 0;
+    memcpy(out, s->last_in, s->last_in_len);
+    return (int)s->last_in_len;
+}

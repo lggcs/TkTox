@@ -1,0 +1,18 @@
+# Build output (regenerable)
+/build/
+
+# Vendored deps (regenerable via `bash fetch-deps.sh <arch>`)
+/vendor/
+
+# Test artifacts (regenerable)
+build/*.log
+build/*.tox
+build/*.tox.*
+build/test_*
+
+# Runtime profiles (user data — never commit)
+*.tox
+*.tox.oq
+*.tox.tt
+*.tox.ses
+*.tox.ava
