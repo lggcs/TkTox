@@ -186,6 +186,18 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
             return true;
         }
         if (n == TT_E2EE_DECODE_FAIL) {
+            /* A decode failure on an ACTIVE session is a chain desync (the
+               two sides restored diverged chain roots), not a legacy peer —
+               a legacy client could never have established a session with
+               us. Re-establish: the peer (also active) sees our fresh INIT
+               and yields to re-run as responder, so the handshake completes
+               with fresh chains. Without this the two sides wedge forever
+               and every text is silently dropped. */
+            if (s->active) {
+                TT_LOG("e2ee", "session desync(%u): re-establishing", fn);
+                e2ee_start(t, fn);
+                return true;
+            }
             /* not a valid frame: the peer is a legacy client sending
                plaintext. Fall back to plaintext for this connection and
                warn the user (unless E2EE is enforced for this friend). */
