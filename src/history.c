@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <tox/toxencryptsave.h>
 
@@ -38,6 +39,7 @@ bool tt_hist_save(const char *profile_path, struct Tox_Pass_Key *pass_key,
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *fp = fopen(tmp, "wb");
     if (!fp) return false;
+    fchmod(fileno(fp), 0600);
     fwrite(TT_HIST_MAGIC, 1, 5, fp);
     for (size_t i = 0; i < count; i++) {
         const TTHistEntry *e = &entries[i];
@@ -81,6 +83,7 @@ bool tt_hist_save(const char *profile_path, struct Tox_Pass_Key *pass_key,
         snprintf(tmp2, sizeof tmp2, "%s.enc", path);
         FILE *ef = fopen(tmp2, "wb");
         if (!ef) { free(ct); remove(tmp); return false; }
+        fchmod(fileno(ef), 0600);
         fwrite(ct, 1, ct_len, ef);
         fclose(ef);
         free(ct);
@@ -130,6 +133,9 @@ bool tt_hist_load(const char *profile_path, struct Tox_Pass_Key *pass_key,
         off += (size_t)n;
         if (off >= (size_t)pt_len || buf[off] != '\n') break;
         off++;
+        /* bound klen/tlen to the buffer size so the length arithmetic below
+           cannot wrap size_t and bypass the bounds check (OOB read) */
+        if (klen > (size_t)pt_len || tlen > (size_t)pt_len) break;
         if (off + klen + 1 + tlen > (size_t)pt_len) break;
         if (klen == strlen(key) && memcmp(buf + off, key, klen) == 0) {
             off += klen;

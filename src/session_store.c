@@ -3,10 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include <tox/toxencryptsave.h>
 
 #include "log.h"
+#include "session.h"   /* TTSession layout for diagnostics */
 #include "tox_thread.h" /* TT_MAX_FRIENDS */
 
 #define TT_SES_MAGIC "TTSES1"
@@ -127,6 +130,8 @@ void tt_session_store_save(const TTSession *e2ee, const char *profile_path,
         size_t fn_off = b.len; /* patch the fn placeholder */
         if (session_put(&b, &e2ee[fn])) { free(b.p); return; }
         b.p[fn_off] = (uint8_t)fn;
+        TT_LOG("ses", "saving fn=%u send.seq=%u recv.seq=%u",
+               fn, e2ee[fn].send.seq, e2ee[fn].recv.seq);
     }
 
     /* atomic write: plaintext temp, then encrypt to a second temp, swap */
@@ -134,6 +139,7 @@ void tt_session_store_save(const TTSession *e2ee, const char *profile_path,
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *fp = fopen(tmp, "wb");
     if (!fp) { free(b.p); return; }
+    fchmod(fileno(fp), 0600);
     fwrite(b.p, 1, b.len, fp);
     fclose(fp);
     free(b.p);
@@ -170,6 +176,7 @@ void tt_session_store_save(const TTSession *e2ee, const char *profile_path,
     snprintf(tmp2, sizeof tmp2, "%s.enc", path);
     FILE *ef = fopen(tmp2, "wb");
     if (!ef) { free(ct); remove(tmp); return; }
+    fchmod(fileno(ef), 0600);
     fwrite(ct, 1, ct_len, ef);
     fclose(ef);
     free(ct);
@@ -275,6 +282,8 @@ void tt_session_store_load(TTSession *e2ee, const char *profile_path,
         uint32_t fn = *p;
         if (fn >= TT_MAX_FRIENDS) break;
         if (session_get(&p, end, &e2ee[fn])) break;
+        TT_LOG("ses", "restored fn=%u active send.seq=%u recv.seq=%u",
+               fn, e2ee[fn].send.seq, e2ee[fn].recv.seq);
     }
     free(buf);
 }

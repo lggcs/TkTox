@@ -427,9 +427,11 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
 
     int n = tt_frame_decode(in, in_len, key, &d, pt, pt_cap);
     if (n < 0) {
+        /* restore the original skipped key (not the zeroed one) so a
+           corrupt frame cannot poison the ring with a known key */
+        if (from_ring) skipped_add(&s->recv, d.seq, key);
         sodium_memzero(key, sizeof key);
         sodium_memzero(nonce, sizeof nonce);
-        if (from_ring) skipped_add(&s->recv, d.seq, key); /* restore */
         return TT_E2EE_DECODE_FAIL;
     }
 

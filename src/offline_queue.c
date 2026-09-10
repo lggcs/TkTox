@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <tox/toxencryptsave.h>
 
@@ -81,6 +82,7 @@ void tt_oq_save(const TTOfflineQueue *q, const char *profile_path,
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *fp = fopen(tmp, "wb");
     if (!fp) return;
+    fchmod(fileno(fp), 0600);
     fwrite(TT_OQ_MAGIC, 1, 5, fp);
     for (unsigned fn = 0; fn < 256; fn++) {
         const TTOqFriend *fr = &q->f[fn];
@@ -124,6 +126,7 @@ void tt_oq_save(const TTOfflineQueue *q, const char *profile_path,
         snprintf(tmp2, sizeof tmp2, "%s.enc", path);
         FILE *ef = fopen(tmp2, "wb");
         if (!ef) { free(ct); remove(tmp); return; }
+        fchmod(fileno(ef), 0600);
         fwrite(ct, 1, ct_len, ef);
         fclose(ef);
         free(ct);

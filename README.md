@@ -37,6 +37,53 @@ CRYPTO_PLAN.md for the full design.
   loses the in-memory session, so it is best-effort, not absolute; no
   deniability claim (Tox long-term identity keys pin the session).
 
+Threat model (what the PQ ratchet actually protects)
+----------------------------------------------------
+The PQDR ratchet protects **message content** against two real-world attack
+classes:
+
+- **Long-term key compromise (retrospective decryption).** If an attacker
+  exfiltrates a long-term identity key, they cannot decrypt previously
+  recorded message content. The per-direction ratchet folds
+  `DH_out || KEM_secret` every re-key, so past chain keys are unrecoverable
+  from the long-term key alone — forward secrecy at the content layer.
+- **Harvest-now-decrypt-later (quantum).** An attacker recording ciphertext
+  today cannot decrypt it later with a quantum computer. The SNTRUP761 KEM
+  secret is folded into *every* root step, not just session init, so the
+  post-quantum property holds for the whole session, not only the handshake.
+
+**Threat level — content confidentiality is the strong claim; metadata is
+not.** The ratchet raises content confidentiality to a strong level (forward
+secrecy + PQ), but it is defense-in-depth layered on a transport that itself
+has no ratchet. It does **not** protect:
+
+- **Metadata / traffic analysis.** A passive observer still sees that two
+  endpoints are exchanging messages over the static toxcore transport; the
+  onion layer hides *which* endpoints, not *that* traffic flows.
+- **Active MITM during the in-band handshake.** Mitigated only by comparing
+  the 32-hex verify code out-of-band; without that check, an active MITM can
+  establish a session.
+- **Deniability.** Tox long-term identity keys pin the session; there is no
+  deniability claim.
+
+Safest usage (how to close the metadata gap)
+--------------------------------------------
+The metadata gap above is closed by running over Tor (see the Tor section):
+Tor hides your real IP from every peer and DHT/relay node, and hides the fact
+that you are using tox at all from a local observer (your ISP / LAN) — the
+traffic looks like ordinary Tor TLS. The tox onion layer then hides the
+friend relationship from the Tor exit node. For the strongest posture:
+
+- **Run in Tor mode** (Settings, or `TT_PROXY_HOST`/`TT_PROXY_PORT`) so all
+  tox traffic rides the tunnel. This is the single biggest metadata win.
+- **Verify the 32-hex code out-of-band** for each contact before trusting a
+  session — it is the only defense against an active MITM during the in-band
+  handshake.
+- **Accept the residual Tor limit:** a global passive adversary that can
+  observe both your guard node and your contact's guard node may correlate
+  timing/volume. This is inherent to low-latency anonymity networks, not a
+  tox-specific flaw.
+
 Session persistence (v2)
 ------------------------
 Established sessions are persisted to a `<profile>.ses` sidecar so the M4

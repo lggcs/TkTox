@@ -11,6 +11,8 @@
 #include <errno.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 /* used by callbacks registered long before its definition below */
 static void push_simple(TTToxThread *t, TTEventType type, uint32_t fn, const char *s, size_t len, int ival);
@@ -367,6 +369,7 @@ static void cb_file_recv(Tox *tox, uint32_t friend_number, uint32_t file_number,
    size checks (avatar transfer is not user-visible) */
 static void avatar_on_offer(TTToxThread *t, Tox *tox, uint32_t friend_number,
                             uint32_t file_number, uint64_t file_size) {
+    if (friend_number >= TT_MAX_FRIENDS) return;
     TTAvatar *a = &t->avatars[friend_number];
     if (file_size == 0) {
         /* spec: 0-length avatar = friend removed theirs */
@@ -424,6 +427,7 @@ static void cb_file_recv_chunk(Tox *tox, uint32_t friend_number, uint32_t file_n
                                void *user_data) {
     TTToxThread *t = user_data;
     (void)position;
+    if (friend_number >= TT_MAX_FRIENDS) return;
     /* general DATA transfer takes priority: avatar and DATA offers to the
        same friend use different (file_number) slots, but never trust it */
     TTXfer *x = xfer_find(t, friend_number, file_number);
@@ -527,6 +531,7 @@ static void cb_file_recv_control(Tox *tox, uint32_t friend_number, uint32_t file
                                  Tox_File_Control control, void *user_data) {
     TTToxThread *t = user_data;
     (void)tox;
+    if (friend_number >= TT_MAX_FRIENDS) return;
     /* the sender got CANCEL/PAUSE from us (or we got it from them): any
        control on a tracked general transfer means it is no longer flowing */
     TTXfer *x = xfer_find(t, friend_number, file_number);
@@ -806,9 +811,22 @@ static void handle_cmd_file_accept(TTToxThread *t, uint32_t xfer_id, const char 
         if (got > 0 && (uint64_t)got < x->size)
             resume_at = (uint64_t)got;
     }
-    x->fp = fopen(path, resume_at ? "r+b" : "wb");
-    if (!x->fp) {
+    /* O_NOFOLLOW: never follow a symlink at the destination, so a local
+       attacker cannot redirect the write to an arbitrary file. */
+    int fd = resume_at
+        ? open(path, O_RDWR | O_NOFOLLOW)
+        : open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
         TT_LOG("tox", "file accept: open failed: %s", path);
+        Tox_Err_File_Control cerr;
+        tox_file_control(t->tox, x->fn, x->file_number, TOX_FILE_CONTROL_CANCEL, &cerr);
+        xfer_failed(t, x);
+        return;
+    }
+    x->fp = fdopen(fd, resume_at ? "r+b" : "wb");
+    if (!x->fp) {
+        close(fd);
+        TT_LOG("tox", "file accept: fdopen failed: %s", path);
         Tox_Err_File_Control cerr;
         tox_file_control(t->tox, x->fn, x->file_number, TOX_FILE_CONTROL_CANCEL, &cerr);
         xfer_failed(t, x);
@@ -1459,6 +1477,7 @@ static void save_profile(TTToxThread *t) {
     snprintf(tmp, sizeof tmp, "%s.tmp", t->profile_path);
     FILE *fp = fopen(tmp, "wb");
     if (fp) {
+        fchmod(fileno(fp), 0600);
         if (t->pass_key) {
             size_t ct_len = ssz + TOX_PASS_ENCRYPTION_EXTRA_LENGTH;
             uint8_t *ct = malloc(ct_len);
@@ -2534,6 +2553,11 @@ static void *tox_thread_main(void *arg) {
         TT_LOG("tox", "session at-rest key: ON (distinct salt%s)",
                have_salt ? " from sidecar salt" : "");
     }
+
+    /* Both at-rest keys are derived; drop the passphrase from the process
+       environment so it is not visible via /proc/<pid>/environ or inherited
+       by child processes. */
+    unsetenv("TT_PASSPHRASE");
 
     /* Profile load/save: savedata blob handled as opaque per toxcore docs.
        tox_options_set_savedata_data stores a non-owned pointer, so the buffer

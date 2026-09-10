@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <tox/toxav.h>
 
 static volatile sig_atomic_t g_stop = 0;
@@ -182,10 +183,15 @@ static void echo_bot_set_avatar(void) {
     uint32_t alen = 0;
     unsigned char *png = echo_avatar_png(&alen);
     if (!png) return;
-    FILE *fp = fopen(ECHO_BOT_AVATAR_PATH, "wb");
-    if (fp) {
-        fwrite(png, 1, alen, fp);
-        fclose(fp);
+    int fd = open(ECHO_BOT_AVATAR_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+        FILE *fp = fdopen(fd, "wb");
+        if (fp) {
+            fwrite(png, 1, alen, fp);
+            fclose(fp);
+        } else {
+            close(fd);
+        }
     }
     free(png);
 }
@@ -204,6 +210,10 @@ static void echo_bot_set_avatar(void) {
 #define TT_TEST_FILE_BIG_PATH "/tmp/TkTox-testfile-big.bin"
 #define TT_TEST_FILE_BIG_SIZE (8u * 1024u * 1024u)
 
+/* cap on a peer-declared file size the bot will auto-accept (blocks an
+   unbounded disk-fill write; the test files are 1.5 MiB / 8 MiB) */
+#define TT_BOT_MAX_FILE_SIZE (64u * 1024u * 1024u)
+
 /* round 14: NGC private-group roundtrip constants */
 #define TT_NGC_TOPIC "ngc round 14 topic"
 
@@ -212,8 +222,10 @@ static unsigned char test_file_byte(uint64_t i) {
 }
 
 static bool test_file_write(const char *path, uint64_t size) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) return false;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) { close(fd); return false; }
     unsigned char block[65536];
     for (uint64_t off = 0; off < size; off += sizeof block) {
         size_t n = sizeof block;
@@ -697,7 +709,18 @@ int bot_main(const char *profile, const char *peer_toxid) {
             break;
         case TT_EV_FILE_OFFER: {
             if (initiator) break;
-            /* str "<name>\n<size>", ival xfer id: auto-accept to /tmp */
+            /* str "<name>\n<size>", ival xfer id: auto-accept to /tmp.
+               Cap the declared size so a malicious peer cannot drive an
+               unbounded disk-fill write. */
+            unsigned long long fsize = 0;
+            const char *nl = ev->str ? strchr(ev->str, '\n') : NULL;
+            if (nl) fsize = strtoull(nl + 1, NULL, 10);
+            if (fsize > TT_BOT_MAX_FILE_SIZE) {
+                TT_LOG("bot", "file offer: size %llu exceeds cap %llu — rejecting",
+                       fsize, (unsigned long long)TT_BOT_MAX_FILE_SIZE);
+                tt_queue_post(&tt.in, TT_CMD_FILE_REJECT, 0, NULL, ev->ival);
+                break;
+            }
             file_offered = true;
             file_at = time(NULL);
             TT_LOG("bot", "file offer: %s (xfer id %d) — accepting",
