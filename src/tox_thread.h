@@ -316,12 +316,16 @@ typedef struct TTSettings {
     bool proxy_set;
     char proxy_host[64]; /* IPv4 literal only (fatal refusal otherwise) */
     long proxy_port;
+    bool history;        /* persist chat transcripts to "<profile>.hist" (off by default) */
 } TTSettings;
 
 /* Read "<profile>.tt" (missing or malformed file = defaults). */
 void tt_settings_load(TTSettings *s, const char *profile_path);
 /* Atomically write "<profile>.tt"; empty host clears proxy settings. */
 bool tt_settings_store_proxy(const char *profile_path, const char *host, long port);
+/* Persist the chat-history toggle into the "<profile>.tt" sidecar, preserving
+   the proxy and e2ee lines. Returns false on I/O failure. */
+bool tt_settings_store_history(const char *profile_path, bool on);
 /* Per-friend E2EE enforcement: read the "<profile>.tt" sidecar into
    required[TT_MAX_FRIENDS] (true = require E2EE for that friend number).
    Missing/malformed file = all false. */

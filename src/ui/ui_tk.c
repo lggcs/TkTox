@@ -157,6 +157,7 @@ typedef struct Ui {
     bool name_open;
     bool smsg_open;
     bool st_open;            /* settings dialog (proxy sidecar) */
+    bool history;            /* persist chat transcripts to "<profile>.hist" */
     bool offer_open;         /* file offer accept/decline dialog */
     bool gnew_open;          /* one dialog instance at a time */
     bool gjoin_open;
@@ -903,9 +904,10 @@ static bool group_hist_key(const Group *g, char *out, size_t cap) {
     return true;
 }
 
-/* Save every non-empty transcript to the sidecar. Called on UI shutdown. */
+/* Save every non-empty transcript to the sidecar. Called on UI shutdown.
+   No-op when the chat-history setting is off. */
 static void history_save(Ui *ui) {
-    if (!ui->tt->profile_path) return;
+    if (!ui->history || !ui->tt->profile_path) return;
     /* count entries first (contacts + groups with a key and transcript) */
     size_t cap = 0;
     for (Contact *c = ui->contacts; c; c = c->next) {
@@ -1710,7 +1712,7 @@ static void handle_event(Ui *ui, TTEvent *e) {
         ui->ready = true;
         /* restore persisted chat history now that every friend's public key
            is known (pubkey events precede FRIEND_LIST_END) */
-        if (ui->tt->profile_path) {
+        if (ui->history && ui->tt->profile_path) {
             for (Contact *c = ui->contacts; c; c = c->next)
                 if (!c->is_request) history_load_contact(ui, c);
             roster_render(ui);
@@ -2202,7 +2204,7 @@ static void handle_event(Ui *ui, TTEvent *e) {
                 memcpy(g->chat_id_hex, e->str, TOX_GROUP_CHAT_ID_SIZE * 2);
             g->chat_id_hex[TOX_GROUP_CHAT_ID_SIZE * 2] = '\0';
             /* restore persisted group history once the chat id is known */
-            if (ui->tt->profile_path && !g->transcript[0])
+            if (ui->history && ui->tt->profile_path && !g->transcript[0])
                 history_load_group(ui, g);
         } else if (e->ival == -6) { /* SYNC: self role */
             g->self_role = e->ival2;
@@ -3230,6 +3232,11 @@ static int cc_st_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
     EV("ttk::label", ".st.note", "-text",
        "Applies after restart. TT_PROXY_* env vars override this file.",
        "-foreground", C_HINT);
+    EV("ttk::separator", ".st.hs", "-orient", "horizontal");
+    EV("ttk::checkbutton", ".st.hist", "-text",
+       "Save chat history (transcripts persist across restarts)",
+       "-variable", "tt_hist_var", "-command", "tt_st_hist");
+    EV("set", "tt_hist_var", set.history ? "1" : "0");
     EV("ttk::frame", ".st.b");
     EV("ttk::button", ".st.b.ok", "-text", "Set", "-command", "tt_st_ok", "-style", "Green.TButton");
     EV("ttk::button", ".st.b.clr", "-text", "Clear proxy", "-command", "tt_st_clear");
@@ -3249,7 +3256,9 @@ static int cc_st_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
     EV("grid", ".st.l2", "-row", "7", "-column", "0", "-sticky", "e", "-padx", "2", "-pady", "2");
     EV("grid", ".st.e2", "-row", "7", "-column", "1", "-sticky", "w", "-pady", "2");
     EV("grid", ".st.note", "-row", "8", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "6");
-    EV("grid", ".st.b", "-row", "9", "-column", "0", "-columnspan", "2", "-sticky", "e", "-pady", "8");
+    EV("grid", ".st.hs", "-row", "9", "-column", "0", "-columnspan", "2", "-sticky", "ew", "-pady", "6");
+    EV("grid", ".st.hist", "-row", "10", "-column", "0", "-columnspan", "2", "-sticky", "w", "-pady", "2");
+    EV("grid", ".st.b", "-row", "11", "-column", "0", "-columnspan", "2", "-sticky", "e", "-pady", "8");
     EV("pack", ".st.b.ok", "-side", "right", "-padx", "4");
     EV("pack", ".st.b.clr", "-side", "right", "-padx", "4");
     EV("pack", ".st.b.no", "-side", "right");
@@ -3260,6 +3269,20 @@ static int cc_st_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
     const char *env_host = getenv("TT_PROXY_HOST");
     if (env_host && env_host[0])
         TT_LOG("tk", "TT_PROXY_HOST=%s is active — sidecar proxy is overridden at start", env_host);
+    return TCL_OK;
+}
+
+static int cc_st_hist(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (!ui->st_open) return TCL_OK;
+    EV("set", "tt_hist_var");
+    bool hist = (strcmp(Tcl_GetStringResult(ui->interp), "1") == 0);
+    if (tt_settings_store_history(ui->tt->profile_path, hist)) {
+        ui->history = hist;
+        TT_LOG("tk", "chat history %s", hist ? "enabled" : "disabled");
+    } else {
+        TT_LOG("tk", "failed to write history setting");
+    }
     return TCL_OK;
 }
 
@@ -4657,6 +4680,11 @@ int ui_run(TTToxThread *tt) {
     g_ui.self_presence = TOX_USER_STATUS_NONE;
     g_ui.self_conn = TOX_CONNECTION_NONE;
     g_ui.typing_fn = UINT32_MAX;
+    {
+        TTSettings set;
+        tt_settings_load(&set, tt->profile_path);
+        g_ui.history = set.history;
+    }
 
     Tcl_FindExecutable("TkTox");
     /* The vendored libtcl8.6.so has Debian's script path (/usr/share/tcltk/tcl8.6)
@@ -4702,6 +4730,7 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_smsg_ok", cc_smsg_ok);
     bind_cmd(&g_ui, "tt_smsg_cancel", cc_smsg_cancel);
     bind_cmd(&g_ui, "tt_st_open", cc_st_open);
+    bind_cmd(&g_ui, "tt_st_hist", cc_st_hist);
     bind_cmd(&g_ui, "tt_st_ok", cc_st_ok);
     bind_cmd(&g_ui, "tt_st_clear", cc_st_clear);
     bind_cmd(&g_ui, "tt_st_cancel", cc_st_cancel);

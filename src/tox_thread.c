@@ -401,13 +401,17 @@ void tt_settings_load(TTSettings *s, const char *profile_path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return;
     char line[128];
-    if (fgets(line, sizeof line, fp)) {
+    while (fgets(line, sizeof line, fp)) {
         char host[64];
         long port = 0;
         if (sscanf(line, "proxy %63s %ld", host, &port) == 2) {
             s->proxy_set = true;
             snprintf(s->proxy_host, sizeof s->proxy_host, "%s", host);
             s->proxy_port = port;
+        } else if (strncmp(line, "history", 7) == 0) {
+            char v[16];
+            if (sscanf(line, "history %15s", v) == 1)
+                s->history = (strcmp(v, "on") == 0);
         }
     }
     fclose(fp);
@@ -425,6 +429,16 @@ bool tt_settings_store_proxy(const char *profile_path, const char *host, long po
         fprintf(fp, "proxy %s %ld\n", host, port);
     else
         fputs("noproxy\n", fp);
+    /* preserve the history and e2ee lines if present */
+    FILE *old = fopen(path, "rb");
+    if (old) {
+        char line[512];
+        while (fgets(line, sizeof line, old)) {
+            if (strncmp(line, "history", 7) == 0 || strncmp(line, "e2ee", 4) == 0)
+                fputs(line, fp);
+        }
+        fclose(old);
+    }
     if (fclose(fp) != 0 || rename(tmp, path) != 0) {
         unlink(tmp);
         return false;
@@ -432,11 +446,36 @@ bool tt_settings_store_proxy(const char *profile_path, const char *host, long po
     return true;
 }
 
-/* Per-friend E2EE enforcement sidecar. The "<profile>.tt" file carries one
-   line per setting group; the E2EE line lists enforced friend numbers:
-     e2ee <fn> <fn> ...
-   A missing line means no enforcement. The proxy line (if any) is preserved
-   on write. */
+/* Persist the chat-history toggle. The "<profile>.tt" file carries one line
+   per setting group; the history line is "history on|off". The proxy and e2ee
+   lines (if any) are preserved on write. */
+bool tt_settings_store_history(const char *profile_path, bool on) {
+    if (!profile_path) return false;
+    char path[strlen(profile_path) + 4];
+    sprintf(path, "%s.tt", profile_path);
+    char tmp[strlen(profile_path) + 8];
+    sprintf(tmp, "%s.tt.new", profile_path);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) return false;
+    /* preserve the proxy and e2ee lines if present */
+    FILE *old = fopen(path, "rb");
+    if (old) {
+        char line[512];
+        while (fgets(line, sizeof line, old)) {
+            if (strncmp(line, "proxy", 5) == 0 || strncmp(line, "noproxy", 7) == 0 ||
+                strncmp(line, "e2ee", 4) == 0)
+                fputs(line, fp);
+        }
+        fclose(old);
+    }
+    fprintf(fp, "history %s\n", on ? "on" : "off");
+    if (fclose(fp) != 0 || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
 void tt_settings_load_e2ee(bool required[TT_MAX_FRIENDS], const char *profile_path) {
     memset(required, 0, TT_MAX_FRIENDS * sizeof(bool));
     if (!profile_path) return;
@@ -471,12 +510,13 @@ bool tt_settings_store_e2ee(const bool required[TT_MAX_FRIENDS],
     sprintf(tmp, "%s.tt.new", profile_path);
     FILE *fp = fopen(tmp, "wb");
     if (!fp) return false;
-    /* preserve the proxy line if present */
+    /* preserve the proxy and history lines if present */
     FILE *old = fopen(path, "rb");
     if (old) {
         char line[128];
-        if (fgets(line, sizeof line, old)) {
-            if (strncmp(line, "proxy", 5) == 0 || strncmp(line, "noproxy", 7) == 0)
+        while (fgets(line, sizeof line, old)) {
+            if (strncmp(line, "proxy", 5) == 0 || strncmp(line, "noproxy", 7) == 0 ||
+                strncmp(line, "history", 7) == 0)
                 fputs(line, fp);
         }
         fclose(old);
@@ -2136,14 +2176,32 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
     case TT_CMD_ADD_FRIEND: handle_cmd_add(t, ev->str); break;
     case TT_CMD_ACCEPT_FRIEND: handle_cmd_accept(t, ev->str); break;
     case TT_CMD_DELETE_FRIEND: {
+        uint32_t fn = ev->friend_number;
         Tox_Err_Friend_Delete derr;
-        tox_friend_delete(t->tox, ev->friend_number, &derr);
-        TT_LOG("tox", "friend delete(%u): %d", ev->friend_number, (int)derr);
-        if (tt_oq_count(&t->oq, ev->friend_number) > 0) {
+        tox_friend_delete(t->tox, fn, &derr);
+        TT_LOG("tox", "friend delete(%u): %d", fn, (int)derr);
+        if (tt_oq_count(&t->oq, fn) > 0) {
             static char out[TT_OQ_MAX_PER_FRIEND][TT_OQ_MAX_LINE];
             int n = 0;
-            tt_oq_take_all(&t->oq, ev->friend_number, out, &n);
+            tt_oq_take_all(&t->oq, fn, out, &n);
             tt_oq_save(&t->oq, t->profile_path, t->pass_key);
+        }
+        /* Drop all E2EE state for the deleted friend: the ratchet session,
+           the enforcement/fallback policy, and the handshake bookkeeping.
+           Otherwise a re-added friend with the same number inherits a stale
+           session and the UI can show a ghost 'unknown' contact. */
+        if (t->e2ee && fn < TT_MAX_FRIENDS) {
+            tt_session_clear(&t->e2ee[fn]);
+            t->e2ee_required[fn] = false;
+            t->e2ee_fallback[fn] = false;
+            t->e2ee_handshake_at[fn] = 0;
+            t->e2ee_warned[fn] = false;
+            if (!tt_settings_store_e2ee(t->e2ee_required, t->profile_path))
+                TT_LOG("tox", "friend delete(%u): failed to persist e2ee policy", fn);
+            /* Persist the cleared session store now (not just at shutdown) so
+               the stale session is not restored from the .ses sidecar on the
+               next startup. With no active sessions left the sidecar is dropped. */
+            tt_session_store_save(t->e2ee, t->profile_path, t->session_key);
         }
         save_profile(t);
         break;
