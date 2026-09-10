@@ -1,6 +1,7 @@
 #include "tox_thread.h"
 #include "headless.h"
 #include "log.h"
+#include "chess.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -258,6 +259,28 @@ static bool echo_test_file_verify(void) {
     return ok && off == TT_TEST_FILE_SIZE;
 }
 
+/* Chess interop test phase (TT_BOT_CHESS): a scripted scholar's mate played
+   over the real lossless-packet wire with toxic's game_chess.c framing.
+   The verified sequence (from tests/chess_test.c) is:
+     e2e4 e7e5 f1c4 b8c6 d1h5 g8f6 h5f7  (white mates on move 7)
+   Each side posts its own colour's moves as TT_CMD_CHESS_MOVE when the
+   engine says it is their turn. Returns true once the game has ended. */
+static bool chess_play_script(TTToxThread *tt, bool we_white, int *idx) {
+    static const char *const seq[] = {
+        "e2e4", "e7e5", "f1c4", "b8c6", "d1h5", "g8f6", "h5f7"
+    };
+    /* seq alternates white, black, white, ... — even indices are white's */
+    int n = (int)(sizeof seq / sizeof seq[0]);
+    /* advance past moves that are not ours (the opponent's moves arrive as
+       CHESS_MOVE events and we must not replay them) */
+    while (*idx < n && ((*idx % 2) == 0) != we_white) (*idx)++;
+    if (*idx >= n) return true; /* all our moves played */
+    TT_LOG("bot", "chess: playing %s", seq[*idx]);
+    tt_queue_post(&tt->in, TT_CMD_CHESS_MOVE, 0, seq[*idx], 0);
+    (*idx)++;
+    return *idx >= n;
+}
+
 int bot_main(const char *profile, const char *peer_toxid) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
@@ -355,6 +378,17 @@ int bot_main(const char *profile, const char *peer_toxid) {
     int reorder_rx = 0;   /* responder: m1/m2/m3 received (recovered) */
     int reorder_echo = 0; /* initiator: m1/m2/m3 echoes received back */
     bool replay_posted = false;
+    /* chess interop: TT_BOT_CHESS runs a scripted scholar's mate over the
+       real lossless-packet wire (toxic game_chess.c framing). The initiator
+       invites on friend-online; the responder auto-accepts; both sides play
+       their colour's moves from the verified sequence and assert the
+       checkmate + winner. Solo mode: no file/group phases. */
+    bool chess_mode = getenv("TT_BOT_CHESS") != NULL;
+    bool chess_invited = false, chess_started = false, chess_ended = false;
+    bool chess_we_white = false, chess_we_won = false;
+    int chess_move_idx = 0;
+    time_t chess_at = 0;
+    if (chess_mode) call_solo = true;
     /* tier B3 offline test: valid-checksum ToxID for a key nobody owns
        (key 0xa0..0xbe,0x7f — last byte < 128 per public_key_valid — plus
        nospam 0xffffffff; data_checksum XOR-fold over the 36 bytes =
@@ -448,6 +482,18 @@ int bot_main(const char *profile, const char *peer_toxid) {
                 rc = 3;
                 break;
             }
+            /* chess interop: fail fast if the game never starts or never
+               ends within the window */
+            if (chess_mode && !chess_ended && chess_at != 0 &&
+                time(NULL) - chess_at >= 30) {
+                TT_LOG("bot", "chess: phase timed out (started=%d ended=%d)",
+                       chess_started, chess_ended);
+                rc = 3;
+                break;
+            }
+            /* chess interop: exit once the game has ended (both peers set
+               rc=0 in the CHESS_END handler) */
+            if (chess_mode && chess_ended) break;
             /* M4 harness: once the session is live, the initiator drives the
                ratchet edge cases. reorder: post the out-of-order delivery
                (seq 3,2,4) and wait for the responder's m2/m3/m4 echoes.
@@ -643,7 +689,7 @@ int bot_main(const char *profile, const char *peer_toxid) {
                         rc = 2;
                         break;
                     }
-                } else if (rc == 0 && !cancel_mode &&
+                } else if (rc == 0 && !cancel_mode && !chess_mode &&
                            time(NULL) - pong_at >= 5) {
                     /* M-AV2 solo: the call hold above breaks out instead —
                        never take the round-13 file-phase exit mid-call */
@@ -795,7 +841,7 @@ int bot_main(const char *profile, const char *peer_toxid) {
             break;
         case TT_EV_FRIEND_CONNECTION:
             TT_LOG("bot", "friend %u connection: %d", ev->friend_number, ev->ival);
-            if (initiator && !ping_sent && ev->ival != 0) {
+            if (initiator && !ping_sent && ev->ival != 0 && !chess_mode) {
                 ping_sent = true;
                 tt_queue_post(&tt.in, TT_CMD_SEND_MESSAGE, ev->friend_number, "ping-m2", 0);
                 TT_LOG("bot", "sent ping to %u", ev->friend_number);
@@ -809,6 +855,15 @@ int bot_main(const char *profile, const char *peer_toxid) {
                 call_at = time(NULL);
                 TT_LOG("bot", "decline test: calling friend %u (audio 32k)", ev->friend_number);
                 tt_queue_post2(&tt.in, TT_CMD_AV_CALL, ev->friend_number, NULL, 32, 0);
+            }
+            /* chess interop: the initiator invites the moment the friend is
+               connected (the ping is skipped in chess mode — the game is the
+               whole phase) */
+            if (initiator && chess_mode && !chess_invited && ev->ival != 0) {
+                chess_invited = true;
+                chess_at = time(NULL);
+                TT_LOG("bot", "chess: inviting friend %u", ev->friend_number);
+                tt_queue_post(&tt.in, TT_CMD_CHESS_INVITE, ev->friend_number, NULL, 0);
             }
             break;
         case TT_EV_FRIEND_MESSAGE:
@@ -1035,6 +1090,48 @@ int bot_main(const char *profile, const char *peer_toxid) {
                 e2ee_established = true;
             }
             break;
+        /* ---- chess interop phase (TT_BOT_CHESS) ---- */
+        case TT_EV_CHESS_INVITE:
+            if (!initiator && chess_mode) {
+                /* the invite tells us the colour WE would play */
+                chess_we_white = (ev->str && strcmp(ev->str, "white") == 0);
+                chess_at = time(NULL);
+                TT_LOG("bot", "chess: invite from %u — we play %s",
+                       ev->friend_number, chess_we_white ? "white" : "black");
+                tt_queue_post(&tt.in, TT_CMD_CHESS_ACCEPT, ev->friend_number, NULL, 0);
+            }
+            break;
+        case TT_EV_CHESS_START:
+            if (chess_mode) {
+                chess_started = true;
+                chess_we_white = (ev->ival == 1);
+                chess_at = time(NULL);
+                TT_LOG("bot", "chess: game started — we are %s",
+                       chess_we_white ? "white" : "black");
+                /* white moves first; if we are white, play our first move */
+                if (chess_we_white)
+                    chess_play_script(&tt, chess_we_white, &chess_move_idx);
+            }
+            break;
+        case TT_EV_CHESS_MOVE:
+            if (chess_mode) {
+                TT_LOG("bot", "chess: opponent moved %s", ev->str ? ev->str : "?");
+                /* after the opponent's move it is our turn (unless the game
+                   just ended) — play our next scripted move */
+                if (!chess_ended)
+                    chess_play_script(&tt, chess_we_white, &chess_move_idx);
+            }
+            break;
+        case TT_EV_CHESS_END:
+            if (chess_mode) {
+                chess_ended = true;
+                chess_we_won = (ev->ival2 == 1);
+                TT_LOG("bot", "chess: game over (reason %d, we_won=%d)",
+                       ev->ival, ev->ival2);
+                rc = 0;
+                break;
+            }
+            break;
         /* ---- M-AV2: call-signaling phase ---- */
         case TT_EV_AV_INCOMING:
             if (!initiator && call_mode) {
@@ -1210,6 +1307,16 @@ int bot_main(const char *profile, const char *peer_toxid) {
             if (initiator && !replay_posted) rc = 3;
         }
     }
+    if (chess_mode && rc == 0) {
+        /* chess interop: the game must have started and ended. The scripted
+           scholar's mate is delivered by white, so the winner must be the
+           white side — we won iff we were white. (The engine assigns colours
+           at random, so the initiator is not necessarily white.) */
+        TT_LOG("bot", "chess: started=%d ended=%d we_white=%d we_won=%d",
+               chess_started, chess_ended, chess_we_white, chess_we_won);
+        if (!chess_started || !chess_ended) rc = 3;
+        if (chess_we_won != chess_we_white) rc = 3;
+    }
     return rc;
 }
 
@@ -1257,6 +1364,36 @@ int echo_main(const char *profile) {
                        (int)(ev->str_len > 64 ? 64 : ev->str_len), ev->str);
                 tt_queue_post(&tt.in, TT_CMD_SEND_MESSAGE, ev->friend_number, ev->str, 0);
             }
+            break;
+        /* chess interop: accept invites and mirror the user's moves. The
+           mirror of a move is the same file, rank flipped (1<->8, 2<->7,
+           ...) — a natural "echo" reply that keeps the game legal. */
+        case TT_EV_CHESS_INVITE:
+            TT_LOG("echo", "chess invite from %u (we play %s) — accepting",
+                   ev->friend_number, ev->str ? ev->str : "?");
+            tt_queue_post(&tt.in, TT_CMD_CHESS_ACCEPT, ev->friend_number, NULL, 0);
+            break;
+        case TT_EV_CHESS_START:
+            TT_LOG("echo", "chess game started with %u (we are %s)",
+                   ev->friend_number, ev->ival == 1 ? "white" : "black");
+            break;
+        case TT_EV_CHESS_MOVE:
+            if (ev->str && ev->str_len == 4) {
+                /* mirror: same file, rank flipped. e2e4 -> e7e5, d1h5 -> d8h4 */
+                char mv[5];
+                mv[0] = ev->str[0];
+                mv[1] = (char)('1' + ('8' - ev->str[1]));
+                mv[2] = ev->str[2];
+                mv[3] = (char)('1' + ('8' - ev->str[3]));
+                mv[4] = '\0';
+                TT_LOG("echo", "chess: user moved %s — mirroring %s",
+                       ev->str, mv);
+                tt_queue_post(&tt.in, TT_CMD_CHESS_MOVE, ev->friend_number, mv, 0);
+            }
+            break;
+        case TT_EV_CHESS_END:
+            TT_LOG("echo", "chess game with %u ended (reason %d, we_won=%d)",
+                   ev->friend_number, ev->ival, ev->ival2);
             break;
         /* M-AV1: answer calls so manual UI testing exercises real audio */
         case TT_EV_AV_INCOMING:

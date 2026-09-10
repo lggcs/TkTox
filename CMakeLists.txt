@@ -98,6 +98,7 @@ set(TT_SOURCES
   src/main.c
   src/headless.c
   src/tox_thread.c
+  src/chess.c
   src/av.c
   src/audio_alsa.c
   src/video_v4l2.c

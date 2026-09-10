@@ -1,4 +1,5 @@
 #include "tox_thread.h"
+#include "chess.h"
 #include "log.h"
 #include "av.h"
 #include "session.h"
@@ -1337,6 +1338,262 @@ static void publish_toxid(TTToxThread *t) {
     }
 }
 
+/* ---- Chess interop (wire-compatible with toxic's game_chess.c) ----
+   Lossless custom packets: type 160 = invite, 161 = data. After the type
+   byte, the shared game header is [0]=0x01 version, [1]=1 (Chess),
+   [2..5]=game id (u32 BE). The chess payload follows:
+     invite 0x01 + colour (the invitee's colour: 0 White / 1 Black)
+     accept 0x02
+     move   0xFE + from.L + from.N + to.L + to.N (algebraic a1-h8)
+     resign 0xFF
+   Integers are big-endian. */
+
+#define TT_GAME_PACKET_INVITE 160
+#define TT_GAME_PACKET_DATA   161
+#define TT_GAME_HEADER_SIZE   6   /* type byte + version + game type + id */
+#define TT_GAME_VERSION       0x01
+#define TT_GAME_TYPE_CHESS    1
+
+#define TT_CHESS_PKT_INVITE   0x01
+#define TT_CHESS_PKT_ACCEPT   0x02
+#define TT_CHESS_PKT_MOVE     0xFE
+#define TT_CHESS_PKT_RESIGN   0xFF
+
+static void chess_pack_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static uint32_t chess_unpack_u32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* Send a chess packet to fn. `type` is the custom packet type (160/161);
+   `payload`/`plen` is the chess sub-payload (after the game header). */
+static bool chess_send(TTToxThread *t, uint32_t fn, int type, uint32_t id,
+                       const uint8_t *payload, size_t plen) {
+    uint8_t pkt[TT_GAME_HEADER_SIZE + 8];
+    if (plen > sizeof pkt - TT_GAME_HEADER_SIZE) return false;
+    pkt[0] = (uint8_t)type;
+    pkt[1] = TT_GAME_VERSION;
+    pkt[2] = TT_GAME_TYPE_CHESS;
+    chess_pack_u32(pkt + 3, id);
+    if (plen) memcpy(pkt + TT_GAME_HEADER_SIZE, payload, plen);
+    Tox_Err_Friend_Custom_Packet err;
+    if (!tox_friend_send_lossless_packet(t->tox, fn, pkt, TT_GAME_HEADER_SIZE + plen, &err)) {
+        TT_LOG("tox", "chess send(%u): err %d", fn, (int)err);
+        return false;
+    }
+    return true;
+}
+
+/* Free and clear the game for fn. */
+static void chess_free(TTToxThread *t, uint32_t fn) {
+    if (fn >= TT_MAX_FRIENDS) return;
+    free(t->chess[fn]);
+    t->chess[fn] = NULL;
+}
+
+/* Emit TT_EV_CHESS_END for fn and tear down the game. */
+static void chess_end(TTToxThread *t, uint32_t fn, int reason, bool we_won) {
+    if (fn >= TT_MAX_FRIENDS || !t->chess[fn]) return;
+    TTEvent *ev = tt_event_new(TT_EV_CHESS_END);
+    if (ev) {
+        ev->friend_number = fn;
+        ev->ival = reason;
+        ev->ival2 = we_won ? 1 : 0;
+        tt_queue_push(&t->out, ev);
+    }
+    chess_free(t, fn);
+}
+
+/* Handle an inbound chess packet (after the game header has been stripped).
+   `type` is the custom packet type (160 invite / 161 data). */
+static void chess_rx(TTToxThread *t, uint32_t fn, int type,
+                     const uint8_t *data, size_t length) {
+    if (fn >= TT_MAX_FRIENDS) return;
+    if (length < 1) return;
+    uint8_t pkt = data[0];
+
+    if (type == TT_GAME_PACKET_INVITE) {
+        /* invite: [0]=0x01, [1]=invitee colour */
+        if (length != 2 || pkt != TT_CHESS_PKT_INVITE) return;
+        uint8_t colour = data[1];
+        if (colour != TT_COLOR_WHITE && colour != TT_COLOR_BLACK) return;
+        /* if we already have a game with this friend, ignore a new invite */
+        if (t->chess[fn]) return;
+        TTChessGame *g = calloc(1, sizeof *g);
+        if (!g) return;
+        g->pending_invite = true;
+        g->self_color = (TTColor)colour;
+        t->chess[fn] = g;
+        push_simple(t, TT_EV_CHESS_INVITE, fn,
+                    colour == TT_COLOR_WHITE ? "white" : "black", 0, 0);
+        return;
+    }
+
+    if (type != TT_GAME_PACKET_DATA) return;
+    TTChessGame *g = t->chess[fn];
+    if (!g) return;
+
+    switch (pkt) {
+        case TT_CHESS_PKT_ACCEPT: {
+            /* we invited; the peer accepted. Game is live. */
+            if (length != 1 || g->pending_invite || g->started) return;
+            g->started = true;
+            push_simple(t, TT_EV_CHESS_START, fn, NULL, 0,
+                        g->self_color == TT_COLOR_WHITE ? 1 : 0);
+            break;
+        }
+        case TT_CHESS_PKT_MOVE: {
+            if (length != 5 || !g->started) return;
+            char from[3] = { (char)data[1], (char)data[2], '\0' };
+            char to[3]   = { (char)data[3], (char)data[4], '\0' };
+            int fr, ff, tr, tf;
+            if (!tt_chess_parse_square(from, &fr, &ff) ||
+                !tt_chess_parse_square(to, &tr, &tf))
+                return;
+            /* the peer moves their pieces; the engine's to_move must be the
+               peer's colour for the move to be accepted */
+            if (g->board.to_move == g->self_color) return; /* not their turn */
+            if (!tt_chess_move(&g->board, fr, ff, tr, tf)) {
+                TT_LOG("tox", "chess: illegal move from %u: %s%s", fn, from, to);
+                return;
+            }
+            char mv[5];
+            memcpy(mv, from, 2);
+            memcpy(mv + 2, to, 2);
+            mv[4] = '\0';
+            push_simple(t, TT_EV_CHESS_MOVE, fn, mv, 4, 0);
+            /* check for game end */
+            if (g->board.status == TT_CHESS_CHECKMATE) {
+                bool we_won = g->board.winner == g->self_color;
+                chess_end(t, fn, 0, we_won);
+            } else if (g->board.status == TT_CHESS_STALEMATE) {
+                chess_end(t, fn, 1, false);
+            }
+            break;
+        }
+        case TT_CHESS_PKT_RESIGN: {
+            if (length != 1 || !g->started) return;
+            /* the peer resigned: we win */
+            chess_end(t, fn, 2, true);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/* Lossless custom packet callback (toxcore). */
+static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
+                                       const uint8_t *data, size_t length,
+                                       void *user_data) {
+    TTToxThread *t = user_data;
+    (void)tox;
+    if (length < TT_GAME_HEADER_SIZE) return;
+    int type = data[0];
+    if (type != TT_GAME_PACKET_INVITE && type != TT_GAME_PACKET_DATA) return;
+    if (data[1] != TT_GAME_VERSION) return;
+    if (data[2] != TT_GAME_TYPE_CHESS) return;
+    uint32_t id = chess_unpack_u32(data + 3);
+    (void)id;
+    chess_rx(t, friend_number, type, data + TT_GAME_HEADER_SIZE,
+             length - TT_GAME_HEADER_SIZE);
+}
+
+/* ---- chess command handlers (UI -> tox thread) ---- */
+
+static void handle_cmd_chess_invite(TTToxThread *t, uint32_t fn) {
+    if (fn >= TT_MAX_FRIENDS || t->chess[fn]) return;
+    TTChessGame *g = calloc(1, sizeof *g);
+    if (!g) return;
+    tt_chess_init(&g->board);
+    /* random colour, matching toxic's rand_range_not_secure(2) */
+    uint32_t r;
+    randombytes_buf(&r, sizeof r);
+    g->self_color = (r & 1) ? TT_COLOR_BLACK : TT_COLOR_WHITE;
+    g->id = (uint32_t)r;
+    t->chess[fn] = g;
+    /* invite payload: [0]=0x01, [1]=the INVITEE's colour (opposite of ours) */
+    uint8_t payload[2] = { TT_CHESS_PKT_INVITE,
+                           (uint8_t)(g->self_color == TT_COLOR_WHITE ? TT_COLOR_BLACK : TT_COLOR_WHITE) };
+    if (!chess_send(t, fn, TT_GAME_PACKET_INVITE, g->id, payload, sizeof payload)) {
+        chess_free(t, fn);
+        return;
+    }
+    TT_LOG("tox", "chess invite(%u): we are %s", fn,
+           g->self_color == TT_COLOR_WHITE ? "white" : "black");
+}
+
+static void handle_cmd_chess_accept(TTToxThread *t, uint32_t fn) {
+    if (fn >= TT_MAX_FRIENDS) return;
+    TTChessGame *g = t->chess[fn];
+    if (!g || !g->pending_invite) return;
+    tt_chess_init(&g->board);
+    g->pending_invite = false;
+    g->started = true;
+    uint8_t payload[1] = { TT_CHESS_PKT_ACCEPT };
+    if (!chess_send(t, fn, TT_GAME_PACKET_DATA, g->id, payload, sizeof payload)) {
+        chess_free(t, fn);
+        return;
+    }
+    push_simple(t, TT_EV_CHESS_START, fn, NULL, 0,
+                g->self_color == TT_COLOR_WHITE ? 1 : 0);
+}
+
+static void handle_cmd_chess_decline(TTToxThread *t, uint32_t fn) {
+    if (fn >= TT_MAX_FRIENDS) return;
+    TTChessGame *g = t->chess[fn];
+    if (!g || !g->pending_invite) return;
+    chess_free(t, fn);
+}
+
+static void handle_cmd_chess_move(TTToxThread *t, uint32_t fn, const char *mv) {
+    if (fn >= TT_MAX_FRIENDS) return;
+    TTChessGame *g = t->chess[fn];
+    if (!g || !g->started || !mv || strlen(mv) != 4) return;
+    char from[3] = { mv[0], mv[1], '\0' };
+    char to[3]   = { mv[2], mv[3], '\0' };
+    int fr, ff, tr, tf;
+    if (!tt_chess_parse_square(from, &fr, &ff) ||
+        !tt_chess_parse_square(to, &tr, &tf))
+        return;
+    if (g->board.to_move != g->self_color) return; /* not our turn */
+    if (!tt_chess_move(&g->board, fr, ff, tr, tf)) {
+        TT_LOG("tox", "chess: illegal move: %s", mv);
+        return;
+    }
+    uint8_t payload[5] = { TT_CHESS_PKT_MOVE,
+                           (uint8_t)mv[0], (uint8_t)mv[1],
+                           (uint8_t)mv[2], (uint8_t)mv[3] };
+    if (!chess_send(t, fn, TT_GAME_PACKET_DATA, g->id, payload, sizeof payload)) {
+        /* friend dropped mid-game; keep the local board but the game is
+           effectively over — resign locally */
+        chess_end(t, fn, 2, false);
+        return;
+    }
+    if (g->board.status == TT_CHESS_CHECKMATE) {
+        bool we_won = g->board.winner == g->self_color;
+        chess_end(t, fn, 0, we_won);
+    } else if (g->board.status == TT_CHESS_STALEMATE) {
+        chess_end(t, fn, 1, false);
+    }
+}
+
+static void handle_cmd_chess_resign(TTToxThread *t, uint32_t fn) {
+    if (fn >= TT_MAX_FRIENDS) return;
+    TTChessGame *g = t->chess[fn];
+    if (!g || !g->started) return;
+    uint8_t payload[1] = { TT_CHESS_PKT_RESIGN };
+    chess_send(t, fn, TT_GAME_PACKET_DATA, g->id, payload, sizeof payload);
+    chess_end(t, fn, 2, false);
+}
+
+
 static void offline_flush_all(TTToxThread *t);
 
 static void cb_self_connection(Tox *tox, Tox_Connection connection, void *user_data) {
@@ -2372,6 +2629,21 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
                t->e2ee_required[ev->friend_number] ? "required" : "allowed");
         break;
     }
+    case TT_CMD_CHESS_INVITE:
+        handle_cmd_chess_invite(t, ev->friend_number);
+        break;
+    case TT_CMD_CHESS_ACCEPT:
+        handle_cmd_chess_accept(t, ev->friend_number);
+        break;
+    case TT_CMD_CHESS_DECLINE:
+        handle_cmd_chess_decline(t, ev->friend_number);
+        break;
+    case TT_CMD_CHESS_MOVE:
+        handle_cmd_chess_move(t, ev->friend_number, ev->str);
+        break;
+    case TT_CMD_CHESS_RESIGN:
+        handle_cmd_chess_resign(t, ev->friend_number);
+        break;
     default:
         TT_LOG("tox", "unknown command %d", (int)ev->type);
         break;
@@ -2841,6 +3113,7 @@ static void *tox_thread_main(void *arg) {
     tox_callback_self_connection_status(tox, cb_self_connection);
     tox_callback_friend_name(tox, cb_friend_name);
     tox_callback_friend_message(tox, cb_friend_message);
+    tox_callback_friend_lossless_packet(tox, cb_friend_lossless_packet);
     tox_callback_friend_connection_status(tox, cb_friend_connection);
     tox_callback_friend_status_message(tox, cb_friend_status_message);
     tox_callback_friend_status(tox, cb_friend_status);
@@ -3001,6 +3274,8 @@ static void *tox_thread_main(void *arg) {
     tt_av_kill(t); /* all active calls forcibly terminated (toxav.h); before tox_kill */
     tox_kill(tox);
     t->tox = NULL;
+    for (uint32_t i = 0; i < TT_MAX_FRIENDS; i++)
+        chess_free(t, i);
     for (int i = 0; i < TT_MAX_XFERS; i++)
         if (t->xfers[i].active) xfer_free(&t->xfers[i]);
     tt_avatar_free(&t->self_avatar);

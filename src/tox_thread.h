@@ -78,6 +78,14 @@ typedef enum {
                                 for each enforced friend and after a toggle. */
     TT_EV_PASSPHRASE_NEEDED, /* GUI mode: the tox thread blocks until the UI
                                 provides the at-rest passphrase (or cancels) */
+    /* chess interop (wire-compatible with toxic's game_chess.c). */
+    TT_EV_CHESS_INVITE,      /* friend_number: someone invited us to chess;
+                                str: "white"/"black" (the colour WE would play) */
+    TT_EV_CHESS_START,       /* friend_number, ival: 1 = we are white, 0 = black.
+                                Game is live; the UI initialises its board. */
+    TT_EV_CHESS_MOVE,        /* friend_number, str: 4-char algebraic move "e2e4" */
+    TT_EV_CHESS_END,         /* friend_number, ival: 0 checkmate, 1 stalemate,
+                                2 resign; ival2: 1 if we won (0 draw/loss) */
     TT_EV_SHUTDOWN,
 } TTEventType;
 
@@ -143,6 +151,14 @@ typedef enum {
     TT_CMD_E2EE_ENFORCE,     /* friend_number, ival: 1 require E2EE (block
                                 plaintext fallback), 0 allow fallback. Persisted
                                 in the settings sidecar. */
+    /* chess interop commands. */
+    TT_CMD_CHESS_INVITE,     /* friend_number: invite the friend to a chess game.
+                                The engine picks our colour at random (matching
+                                toxic) and sends the invite packet. */
+    TT_CMD_CHESS_ACCEPT,     /* friend_number: accept a pending chess invite. */
+    TT_CMD_CHESS_DECLINE,    /* friend_number: decline a pending chess invite. */
+    TT_CMD_CHESS_MOVE,       /* friend_number, str: 4-char algebraic move "e2e4" */
+    TT_CMD_CHESS_RESIGN,     /* friend_number: resign the current game. */
 } TTCommandType;
 
 /* TT_CMD_GROUP_SYNC reply burst (reuses existing event types):
@@ -274,6 +290,9 @@ typedef struct TTToxThread {
     bool e2ee_fallback[TT_MAX_FRIENDS];
     time_t e2ee_handshake_at[TT_MAX_FRIENDS];
     bool e2ee_warned[TT_MAX_FRIENDS];
+    /* Chess interop state (wire-compatible with toxic's game_chess.c). One
+       game per friend. The engine lives in src/chess.c. */
+    struct TTChessGame *chess[TT_MAX_FRIENDS]; /* NULL = no active game */
     /* At-rest passphrase handshake (GUI mode only): the tox thread posts
        TT_EV_PASSPHRASE_NEEDED then blocks on pass_cond until the UI thread
        delivers the passphrase (pass_buf) or cancels (pass_cancel). The

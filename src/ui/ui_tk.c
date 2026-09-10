@@ -15,6 +15,7 @@
 #include "../app_state.h"
 #include "../history.h"
 #include "../log.h"
+#include "../chess.h"
 #include <tcl.h>
 #include <tk.h>
 #include <tox/toxav.h>
@@ -178,6 +179,17 @@ typedef struct Ui {
     size_t video_rgb_cap;
     time_t video_last;       /* pane auto-hide when frames stop */
     int video_self;          /* M-AV5: pane shows the LOCAL camera (pane swap) */
+    /* chess interop: the active game window (one at a time). The engine
+       state lives in the tox thread; the UI mirrors the board for display
+       and posts moves back. */
+    uint32_t chess_fn;       /* friend number of the open game (UINT32_MAX = none) */
+    TTChess chess_board;     /* local mirror of the board */
+    TTColor chess_self;      /* our colour */
+    bool chess_started;      /* game live (moves legal) */
+    bool chess_my_turn;      /* it's our move */
+    int chess_sel_rank, chess_sel_file; /* selected square (-1 = none) */
+    bool chess_dragging;   /* a drag is in progress (press -> release) */
+    bool chess_invite_open;  /* invite accept/decline dialog shown */
 } Ui;
 
 static Ui g_ui;
@@ -187,6 +199,9 @@ static bool contact_all_read(const Contact *c);
 /* used by chead_call_render long before its definition below: the call strip
    packs the avatar FIRST on the right (outermost), then the buttons */
 static void chead_avatar_render(Ui *ui, const Contact *c);
+/* chess interop: used by handle_event before their definitions */
+static void chess_open(Ui *ui, uint32_t fn, TTColor self, bool started);
+static void chess_draw_board(Ui *ui);
 
 /* ---- Tcl plumbing ---- */
 
@@ -2234,6 +2249,96 @@ static void handle_event(Ui *ui, TTEvent *e) {
     case TT_EV_PASSPHRASE_NEEDED:
         pass_dialog_open(ui);
         break;
+    case TT_EV_CHESS_INVITE: {
+        /* someone invited us to chess. Show an accept/decline dialog. */
+        if (ui->chess_invite_open) break;
+        ui->chess_invite_open = true;
+        ui->chess_fn = e->friend_number;
+        ui->chess_self = (e->str && strcmp(e->str, "white") == 0)
+                             ? TT_COLOR_WHITE : TT_COLOR_BLACK;
+        ui->chess_started = false;
+        ui->chess_sel_rank = ui->chess_sel_file = -1;
+        ui->chess_dragging = false;
+        EV("destroy", ".chessinv");
+        EV("toplevel", ".chessinv", "-padx", "14", "-pady", "14");
+        EV("wm", "title", ".chessinv", "Chess invite");
+        dlg_theme(ui, ".chessinv");
+        char msg[128];
+        snprintf(msg, sizeof msg, "invites you to a game of chess. You play %s.",
+                 ui->chess_self == TT_COLOR_WHITE ? "white" : "black");
+        EV("ttk::label", ".chessinv.l", "-text", msg, "-wraplength", "300");
+        EV("ttk::frame", ".chessinv.b");
+        EV("ttk::button", ".chessinv.yes", "-text", "Accept", "-command", "tt_chess_accept",
+           "-style", "Green.TButton");
+        EV("ttk::button", ".chessinv.no", "-text", "Decline", "-command", "tt_chess_decline");
+        EV("pack", ".chessinv.l", "-side", "top", "-anchor", "w", "-pady", "4");
+        EV("pack", ".chessinv.yes", "-side", "right", "-pady", "8", "-padx", "4");
+        EV("pack", ".chessinv.no", "-side", "right", "-pady", "8");
+        EV("pack", ".chessinv.b", "-side", "top", "-anchor", "e");
+        EV("wm", "protocol", ".chessinv", "WM_DELETE_WINDOW", "tt_chess_decline");
+        break;
+    }
+    case TT_EV_CHESS_START: {
+        /* game is live. ival: 1 = we are white, 0 = black. Always re-init
+           the board: as the invitee, chess_fn was already set by the INVITE
+           event, so the old conditional skipped the init and left the board
+           as uninitialised memory (no pieces drawn). */
+        tt_chess_init(&ui->chess_board);
+        ui->chess_fn = e->friend_number;
+        ui->chess_self = (e->ival == 1) ? TT_COLOR_WHITE : TT_COLOR_BLACK;
+        ui->chess_started = true;
+        ui->chess_sel_rank = ui->chess_sel_file = -1;
+        ui->chess_dragging = false;
+        ui->chess_my_turn = (ui->chess_board.to_move == ui->chess_self);
+        if (ui->chess_invite_open) {
+            EV("destroy", ".chessinv");
+            ui->chess_invite_open = false;
+        }
+        chess_open(ui, e->friend_number, ui->chess_self, true);
+        break;
+    }
+    case TT_EV_CHESS_MOVE: {
+        /* the opponent moved. str: 4-char algebraic "e2e4". */
+        if (ui->chess_fn != e->friend_number || !e->str || e->str_len != 4) break;
+        char from[3] = { e->str[0], e->str[1], '\0' };
+        char to[3]   = { e->str[2], e->str[3], '\0' };
+        int fr, ff, tr, tf;
+        if (!tt_chess_parse_square(from, &fr, &ff) ||
+            !tt_chess_parse_square(to, &tr, &tf))
+            break;
+        if (ui->chess_board.to_move == ui->chess_self) break; /* not their turn */
+        if (!tt_chess_move(&ui->chess_board, fr, ff, tr, tf)) break;
+        ui->chess_my_turn = (ui->chess_board.to_move == ui->chess_self);
+        chess_draw_board(ui);
+        break;
+    }
+    case TT_EV_CHESS_END: {
+        /* game over. ival: 0 checkmate, 1 stalemate, 2 resign; ival2: we won. */
+        if (ui->chess_fn != e->friend_number) break;
+        const char *msg;
+        if (e->ival == 0)
+            msg = e->ival2 ? "Checkmate — you win!" : "Checkmate — you lose.";
+        else if (e->ival == 1)
+            msg = "Stalemate — draw.";
+        else
+            msg = e->ival2 ? "Opponent resigned — you win!" : "You resigned.";
+        EV("destroy", ".chessinv");
+        ui->chess_invite_open = false;
+        EV("toplevel", ".chessend", "-padx", "14", "-pady", "14");
+        EV("wm", "title", ".chessend", "Game over");
+        dlg_theme(ui, ".chessend");
+        EV("ttk::label", ".chessend.l", "-text", msg, "-font", "f_bold");
+        EV("ttk::button", ".chessend.ok", "-text", "OK", "-command", "destroy .chessend");
+        EV("pack", ".chessend.l", "-side", "top", "-pady", "6");
+        EV("pack", ".chessend.ok", "-side", "bottom", "-pady", "8");
+        EV("wm", "protocol", ".chessend", "WM_DELETE_WINDOW", "destroy .chessend");
+        /* close the board window */
+        EV("destroy", ".chess");
+        ui->chess_fn = UINT32_MAX;
+        ui->chess_sel_rank = ui->chess_sel_file = -1;
+        ui->chess_dragging = false;
+        break;
+    }
     case TT_EV_SHUTDOWN:
         ui->quitting = true;
         EV("destroy", ".");
@@ -3355,6 +3460,229 @@ static int cc_prof_enforce(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *con
     return TCL_OK;
 }
 
+/* ---- chess interop UI (wire-compatible with toxic's game_chess.c) ----
+   A single toplevel `.chess` window hosts the board. The engine state is
+   mirrored in ui->chess_board for display; moves are posted back to the
+   tox thread as TT_CMD_CHESS_MOVE. */
+
+#define CHESS_CELL 40
+
+static const char *chess_piece_glyph(TTPiece p) {
+    switch (p.type) {
+        case TT_PIECE_PAWN:   return p.color == TT_COLOR_WHITE ? "\xe2\x99\x99" : "\xe2\x99\x9f";
+        case TT_PIECE_ROOK:   return p.color == TT_COLOR_WHITE ? "\xe2\x99\x96" : "\xe2\x99\x9c";
+        case TT_PIECE_KNIGHT: return p.color == TT_COLOR_WHITE ? "\xe2\x99\x98" : "\xe2\x99\x9e";
+        case TT_PIECE_BISHOP: return p.color == TT_COLOR_WHITE ? "\xe2\x99\x97" : "\xe2\x99\x9d";
+        case TT_PIECE_QUEEN:  return p.color == TT_COLOR_WHITE ? "\xe2\x99\x95" : "\xe2\x99\x9b";
+        case TT_PIECE_KING:   return p.color == TT_COLOR_WHITE ? "\xe2\x99\x94" : "\xe2\x99\x9a";
+        default:              return "";
+    }
+}
+
+/* Redraw the board canvas from ui->chess_board. */
+static void chess_draw_board(Ui *ui) {
+    if (ui->chess_fn == UINT32_MAX) return;
+    EV(".chess.cv", "delete", "all");
+    for (int r = 0; r < 8; r++) {
+        for (int f = 0; f < 8; f++) {
+            int x = f * CHESS_CELL, y = (7 - r) * CHESS_CELL;
+            char xs[16], ys[16], xe[16], ye[16];
+            snprintf(xs, sizeof xs, "%d", x);
+            snprintf(ys, sizeof ys, "%d", y);
+            snprintf(xe, sizeof xe, "%d", x + CHESS_CELL);
+            snprintf(ye, sizeof ye, "%d", y + CHESS_CELL);
+            const char *fill = ((r + f) % 2 == 0) ? "#F0D9B5" : "#B58863";
+            EV(".chess.cv", "create", "rectangle", xs, ys, xe, ye,
+               "-fill", fill, "-outline", "#000000", "-tags", "sq");
+            TTPiece p = ui->chess_board.board[r][f];
+            const char *glyph = chess_piece_glyph(p);
+            if (glyph[0]) {
+                char cx[16], cy[16];
+                snprintf(cx, sizeof cx, "%d", x + CHESS_CELL / 2);
+                snprintf(cy, sizeof cy, "%d", y + CHESS_CELL / 2);
+                const char *fg = (p.color == TT_COLOR_WHITE) ? "#FFFFFF" : "#000000";
+                EV(".chess.cv", "create", "text", cx, cy,
+                   "-text", glyph, "-font", "chess_piece", "-fill", fg,
+                   "-tags", "piece");
+            }
+        }
+    }
+    /* highlight the selected square */
+    if (ui->chess_sel_rank >= 0) {
+        int x = ui->chess_sel_file * CHESS_CELL, y = (7 - ui->chess_sel_rank) * CHESS_CELL;
+        char xs[16], ys[16], xe[16], ye[16];
+        snprintf(xs, sizeof xs, "%d", x);
+        snprintf(ys, sizeof ys, "%d", y);
+        snprintf(xe, sizeof xe, "%d", x + CHESS_CELL);
+        snprintf(ye, sizeof ye, "%d", y + CHESS_CELL);
+        EV(".chess.cv", "create", "rectangle", xs, ys, xe, ye,
+           "-outline", "#FF0000", "-width", "3", "-tags", "sel");
+    }
+    /* status line */
+    const char *status = "Chess";
+    if (!ui->chess_started) {
+        status = "Waiting for opponent...";
+    } else if (ui->chess_board.status == TT_CHESS_CHECKMATE) {
+        status = (ui->chess_board.winner == ui->chess_self) ? "Checkmate — you win!" : "Checkmate — you lose.";
+    } else if (ui->chess_board.status == TT_CHESS_STALEMATE) {
+        status = "Stalemate — draw.";
+    } else if (ui->chess_board.status == TT_CHESS_RESIGNED) {
+        status = "Game resigned.";
+    } else if (tt_chess_in_check(&ui->chess_board, ui->chess_self)) {
+        status = ui->chess_my_turn ? "Check — your move." : "Check — opponent's move.";
+    } else {
+        status = ui->chess_my_turn ? "Your move." : "Opponent's move.";
+    }
+    EV(".chess.status", "configure", "-text", status);
+}
+
+/* Open (or focus) the chess window for fn. */
+static void chess_open(Ui *ui, uint32_t fn, TTColor self, bool started) {
+    ui->chess_fn = fn;
+    ui->chess_self = self;
+    ui->chess_started = started;
+    ui->chess_sel_rank = ui->chess_sel_file = -1;
+    ui->chess_dragging = false;
+    ui->chess_my_turn = started && (ui->chess_board.to_move == self);
+    EV("destroy", ".chess");
+    EV("toplevel", ".chess", "-padx", "10", "-pady", "10");
+    EV("wm", "title", ".chess", "Chess");
+    dlg_theme(ui, ".chess");
+    EV("canvas", ".chess.cv", "-width", "320", "-height", "320",
+       "-highlightthickness", "0");
+    EV("ttk::label", ".chess.status", "-text", "Chess", "-font", "f_bold");
+    EV("ttk::frame", ".chess.btns");
+    EV("ttk::button", ".chess.resign", "-text", "Resign", "-command", "tt_chess_resign");
+    EV("ttk::button", ".chess.close", "-text", "Close", "-command", "tt_chess_close");
+    EV("pack", ".chess.cv", "-side", "top");
+    EV("pack", ".chess.status", "-side", "top", "-pady", "4");
+    EV("pack", ".chess.resign", "-side", "left", "-padx", "4", "-pady", "6");
+    EV("pack", ".chess.close", "-side", "left", "-padx", "4", "-pady", "6");
+    EV("pack", ".chess.btns", "-side", "top");
+    EV("bind", ".chess.cv", "<Button-1>", "tt_chess_square %x %y");
+    EV("bind", ".chess.cv", "<ButtonRelease-1>", "tt_chess_drop %x %y");
+    EV("wm", "protocol", ".chess", "WM_DELETE_WINDOW", "tt_chess_close");
+    chess_draw_board(ui);
+}
+
+/* Roster context menu: invite the selected friend to chess. */
+static int cc_chess_invite(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->sel_kind != TT_SEL_CHAT) return TCL_OK;
+    Contact *c = contact_by_fn(ui, ui->sel_fn);
+    if (!c) return TCL_OK;
+    tt_queue_post(&ui->tt->in, TT_CMD_CHESS_INVITE, c->fn, NULL, 0);
+    return TCL_OK;
+}
+
+/* Invite dialog: accept a pending chess invite. */
+static int cc_chess_accept(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->chess_fn == UINT32_MAX) return TCL_OK;
+    uint32_t fn = ui->chess_fn;
+    EV("destroy", ".chessinv");
+    ui->chess_invite_open = false;
+    tt_queue_post(&ui->tt->in, TT_CMD_CHESS_ACCEPT, fn, NULL, 0);
+    return TCL_OK;
+}
+
+/* Invite dialog: decline a pending chess invite. */
+static int cc_chess_decline(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->chess_fn == UINT32_MAX) return TCL_OK;
+    uint32_t fn = ui->chess_fn;
+    EV("destroy", ".chessinv");
+    ui->chess_invite_open = false;
+    ui->chess_fn = UINT32_MAX;
+    tt_queue_post(&ui->tt->in, TT_CMD_CHESS_DECLINE, fn, NULL, 0);
+    return TCL_OK;
+}
+
+/* Chess board press (<Button-1>): select a square holding one of our
+   pieces. The move itself is attempted on release (tt_chess_drop), so both
+   click-to-move (select, then click the target) and drag-and-drop work. */
+static int cc_chess_square(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip;
+    if (objc < 3) return TCL_OK;
+    int x = atoi(Tcl_GetString(objv[1]));
+    int y = atoi(Tcl_GetString(objv[2]));
+    if (ui->chess_fn == UINT32_MAX || !ui->chess_started) return TCL_OK;
+    int file = x / CHESS_CELL;
+    int rank = 7 - (y / CHESS_CELL);
+    if (file < 0 || file > 7 || rank < 0 || rank > 7) return TCL_OK;
+    TTPiece p = ui->chess_board.board[rank][file];
+    if (p.type != TT_PIECE_NONE && p.color == ui->chess_self) {
+        ui->chess_sel_rank = rank;
+        ui->chess_sel_file = file;
+        ui->chess_dragging = true;
+        chess_draw_board(ui);
+    } else {
+        ui->chess_dragging = false; /* pressing empty/opponent square isn't a drag */
+    }
+    return TCL_OK;
+}
+
+/* Chess board release (<ButtonRelease-1>): if a piece is selected and the
+   release square differs from it, attempt the move (drag-and-drop, or the
+   second click of click-to-move). A release on the same square is a plain
+   click — keep the selection. */
+static int cc_chess_drop(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip;
+    if (objc < 3) return TCL_OK;
+    int x = atoi(Tcl_GetString(objv[1]));
+    int y = atoi(Tcl_GetString(objv[2]));
+    if (ui->chess_fn == UINT32_MAX || !ui->chess_started) return TCL_OK;
+    if (ui->chess_sel_rank < 0) return TCL_OK; /* nothing selected */
+    int file = x / CHESS_CELL;
+    int rank = 7 - (y / CHESS_CELL);
+    if (file < 0 || file > 7 || rank < 0 || rank > 7) return TCL_OK;
+    ui->chess_dragging = false;
+    if (rank == ui->chess_sel_rank && file == ui->chess_sel_file)
+        return TCL_OK; /* plain click on the selected piece: keep selection */
+    char from[3], to[3];
+    tt_chess_format_square(ui->chess_sel_rank, ui->chess_sel_file, from);
+    tt_chess_format_square(rank, file, to);
+    char mv[5];
+    memcpy(mv, from, 2);
+    memcpy(mv + 2, to, 2);
+    mv[4] = '\0';
+    ui->chess_sel_rank = ui->chess_sel_file = -1;
+    /* Apply the move to the local board so the display stays in sync with
+       the engine (the engine applies it on its side; we mirror it here).
+       Without this the board is stale after every user move — pieces appear
+       where they no longer are, and the next move is rejected as illegal.
+       Only post the move if it is legal locally. */
+    int fr, ff, tr, tf;
+    if (tt_chess_parse_square(from, &fr, &ff) &&
+        tt_chess_parse_square(to, &tr, &tf) &&
+        tt_chess_move(&ui->chess_board, fr, ff, tr, tf)) {
+        ui->chess_my_turn = (ui->chess_board.to_move == ui->chess_self);
+        chess_draw_board(ui);
+        tt_queue_post(&ui->tt->in, TT_CMD_CHESS_MOVE, ui->chess_fn, mv, 0);
+    }
+    return TCL_OK;
+}
+
+/* Resign the current game. */
+static int cc_chess_resign(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->chess_fn == UINT32_MAX) return TCL_OK;
+    uint32_t fn = ui->chess_fn;
+    tt_queue_post(&ui->tt->in, TT_CMD_CHESS_RESIGN, fn, NULL, 0);
+    return TCL_OK;
+}
+
+/* Close the chess window (local only; the engine game is torn down by the
+   tox thread on TT_EV_CHESS_END or when the friend disconnects). */
+static int cc_chess_close(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    EV("destroy", ".chess");
+    ui->chess_fn = UINT32_MAX;
+    ui->chess_sel_rank = ui->chess_sel_file = -1;
+    ui->chess_dragging = false;
+    return TCL_OK;
+}
+
 /* Up on empty input recalls the last message you sent to the selected friend */
 static int cc_recall(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
     Ui *ui = cd; (void)ip; (void)objv; (void)objc;
@@ -4050,6 +4378,8 @@ static void build_widgets(Ui *ui) {
     EV("font", "create", "f_text", "-family", "Helvetica", "-size", "11");
     EV("font", "create", "f_bold", "-family", "Helvetica", "-size", "12", "-weight", "bold");
     EV("font", "create", "f_small", "-family", "Helvetica", "-size", "10");
+    /* chess pieces: DejaVu Sans has the Unicode chess glyphs (U+2654-265F) */
+    EV("font", "create", "chess_piece", "-family", "DejaVu Sans", "-size", "24");
 
     /* --- ttk style palette (uTox default theme) --- */
     EV("ttk::style", "configure", "TFrame", "-background", C_MAIN_BG);
@@ -4127,6 +4457,8 @@ static void build_widgets(Ui *ui) {
     EV("menu", ".rostermenu", "-tearoff", "0");
     EV(".rostermenu", "add", "command", "-label", "View profile", "-command", "tt_view_profile");
     EV(".rostermenu", "add", "command", "-label", "Copy Tox ID", "-command", "tt_copy_friend_id");
+    EV(".rostermenu", "add", "separator");
+    EV(".rostermenu", "add", "command", "-label", "Play chess", "-command", "tt_chess_invite");
     EV(".rostermenu", "add", "separator");
     EV(".rostermenu", "add", "command", "-label", "Remove friend", "-command", "tt_remove");
     EV("bind", ".sb.rf.roster", "<Button-3>", "tt_roster_menu %x %y %X %Y");
@@ -4379,6 +4711,13 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_copy_friend_id", cc_copy_friend_id);
     bind_cmd(&g_ui, "tt_view_profile", cc_view_profile);
     bind_cmd(&g_ui, "tt_prof_enforce", cc_prof_enforce);
+    bind_cmd(&g_ui, "tt_chess_invite", cc_chess_invite);
+    bind_cmd(&g_ui, "tt_chess_accept", cc_chess_accept);
+    bind_cmd(&g_ui, "tt_chess_decline", cc_chess_decline);
+    bind_cmd(&g_ui, "tt_chess_square", cc_chess_square);
+    bind_cmd(&g_ui, "tt_chess_drop", cc_chess_drop);
+    bind_cmd(&g_ui, "tt_chess_resign", cc_chess_resign);
+    bind_cmd(&g_ui, "tt_chess_close", cc_chess_close);
     bind_cmd(&g_ui, "tt_roster_menu", cc_roster_menu);
     bind_cmd(&g_ui, "tt_recall", cc_recall);
     bind_cmd(&g_ui, "tt_hist_resize", cc_hist_resize);
