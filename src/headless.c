@@ -1376,6 +1376,13 @@ int echo_main(const char *profile) {
         case TT_EV_CHESS_START:
             TT_LOG("echo", "chess game started with %u (we are %s)",
                    ev->friend_number, ev->ival == 1 ? "white" : "black");
+            /* white moves first: if we are white, post an opening move or
+               the game freezes waiting for us (the mirror handler only
+               replies to the user's moves). e2e4 is a legal, natural
+               opening. */
+            if (ev->ival == 1)
+                tt_queue_post(&tt.in, TT_CMD_CHESS_MOVE, ev->friend_number,
+                              "e2e4", 0);
             break;
         case TT_EV_CHESS_MOVE:
             if (ev->str && ev->str_len == 4) {
