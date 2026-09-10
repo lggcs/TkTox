@@ -4,7 +4,7 @@
 /* E2EE session layer (CRYPTO_PLAN M3 handshake + M4 ratchet) over the
    frame codec (crypto.h). Pure state machine — NO Tox calls; the engine
    (tox_thread.c) feeds transport + identity keys in. tt_e2ee_init_mode
-   gates the layer (TT_E2EE=1); default passthrough keeps toxcore E2EE only.
+   gates the layer (ON by default; TT_E2EE=0 disables it).
 
    Handshake (in-band, authenticated by the Tox friend-list identity keys):
      INIT  hdr = IKa(32) || ephA2 pk (32) || ephA3 pk (32) || kem pk A (1158)
@@ -141,7 +141,7 @@ typedef struct TTSession {
     } pending[TT_SESSION_PENDING_MAX];
 } TTSession;
 
-/* Layer switch: read once by the engine (TT_E2EE=1). */
+/* Layer switch: read once by the engine (ON by default; TT_E2EE=0 off). */
 bool tt_e2ee_init_mode(void);
 
 void tt_session_init(TTSession *s);

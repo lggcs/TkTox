@@ -14,7 +14,14 @@ static void sodium_init_once(void) {
     }
 }
 
-bool tt_e2ee_init_mode(void) { return getenv("TT_E2EE") != NULL; }
+/* E2EE is ON by default; only an explicit TT_E2EE=0 disables it. The env
+   var remains as an escape hatch for legacy/headless runs that must not
+   encrypt (e.g. a plaintext-only harness). */
+bool tt_e2ee_init_mode(void) {
+    const char *v = getenv("TT_E2EE");
+    if (v && v[0] == '0') return false;
+    return true;
+}
 
 /* ---- local helpers (crypto.h stays primitive-only) ---- */
 

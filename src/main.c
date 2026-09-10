@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
     if (!profile) profile = "TkTox.tox";
 
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, true)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }

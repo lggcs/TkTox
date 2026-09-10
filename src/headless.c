@@ -18,7 +18,7 @@ static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 int headless_main(const char *profile) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -261,7 +261,7 @@ static bool echo_test_file_verify(void) {
 int bot_main(const char *profile, const char *peer_toxid) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -1224,7 +1224,7 @@ int echo_main(const char *profile) {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint); /* test-ui.sh kills the bot with SIGTERM */
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -1320,7 +1320,7 @@ int echo_main(const char *profile) {
 int persist_test_main(const char *profile, bool phase_b) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -1386,7 +1386,7 @@ int persist_test_main(const char *profile, bool phase_b) {
 int offline_test_main(const char *profile, const char *peer_toxid, bool phase_b) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -1465,7 +1465,7 @@ int offline_test_main(const char *profile, const char *peer_toxid, bool phase_b)
 int flap_test_main(const char *profile, const char *peer_toxid) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -1584,7 +1584,7 @@ int flap_test_main(const char *profile, const char *peer_toxid) {
 int soak_test_main(const char *profile, int minutes) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }
@@ -1618,7 +1618,7 @@ int soak_test_main(const char *profile, int minutes) {
 int invrest_test_main(const char *profile, const char *peer_toxid, bool phase_b) {
     signal(SIGINT, on_sigint);
     TTToxThread tt;
-    if (!tt_tox_thread_start(&tt, profile)) {
+    if (!tt_tox_thread_start(&tt, profile, false)) {
         TT_LOG("main", "failed to start tox thread");
         return 1;
     }

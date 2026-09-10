@@ -23,6 +23,18 @@ static void emit_friend_identity(TTToxThread *t, uint32_t fn);
 
 static bool tt_e2ee_mode;
 
+/* How long we keep retrying the in-band handshake before treating a friend
+   as a legacy client (no E2EE) and falling back to plaintext. INIT
+   retransmits every 5s, so this is ~6 attempts. */
+#define TT_E2EE_FALLBACK_TIMEOUT 30
+
+/* Emit the per-connection E2EE warning system line for fn (deduped). */
+static void e2ee_warn(TTToxThread *t, uint32_t fn, const char *msg) {
+    if (fn >= TT_MAX_FRIENDS || t->e2ee_warned[fn]) return;
+    t->e2ee_warned[fn] = true;
+    push_simple(t, TT_EV_E2EE_WARN, fn, msg, strlen(msg), 0);
+}
+
 /* per-friend transport env: identity keys from toxcore */
 static void e2ee_env(TTToxThread *t, uint32_t fn, TTE2EEEnv *env) {
     static _Thread_local uint8_t self_sk[TOX_SECRET_KEY_SIZE];
@@ -104,10 +116,21 @@ static void e2ee_start(TTToxThread *t, uint32_t fn) {
     int n = tt_session_start(&t->e2ee[fn], &env, out, sizeof out);
     if (n > 0) {
         e2ee_send_frame(t, fn, out, (size_t)n);
+        t->e2ee_handshake_at[fn] = time(NULL);
         TT_LOG("e2ee", "session init(%u)", fn);
     } else {
         TT_LOG("e2ee", "session init(%u) failed: %d", fn, n);
     }
+}
+
+/* True when the friend's handshake has been pending past the fallback
+   timeout (they are a legacy client that never answers INIT). */
+static bool e2ee_fallback_due(TTToxThread *t, uint32_t fn) {
+    if (fn >= TT_MAX_FRIENDS) return false;
+    TTSession *s = &t->e2ee[fn];
+    if (s->active) return false;
+    time_t at = t->e2ee_handshake_at[fn];
+    return at != 0 && time(NULL) - at >= TT_E2EE_FALLBACK_TIMEOUT;
 }
 
 /* post-receive hook (cb_friend_message). Returns true when the event was
@@ -133,6 +156,18 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
             if (rn > 0) e2ee_send_frame(t, fn, out, (size_t)rn);
         }
         if (s->active) {
+            /* a live session means the friend speaks E2EE — clear any
+               legacy-fallback state from a prior connection */
+            t->e2ee_fallback[fn] = false;
+            /* auto-enforce E2EE for this friend going forward: once we have
+               a working encrypted session, never silently downgrade to
+               plaintext on a future connection. Persisted in the sidecar. */
+            if (!was_active && !t->e2ee_required[fn]) {
+                t->e2ee_required[fn] = true;
+                if (!tt_settings_store_e2ee(t->e2ee_required, t->profile_path))
+                    TT_LOG("tox", "e2ee auto-enforce(%u): persist failed", fn);
+                push_simple(t, TT_EV_E2EE_ENFORCE, fn, NULL, 0, 1);
+            }
             e2ee_pump(t, fn); /* initiator: flush stashed texts */
             if (tt_oq_count(&t->oq, fn) > 0 && !t->oq_flushing)
                 offline_flush_friend(t, fn); /* queued texts now flow encrypted */
@@ -147,6 +182,24 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
         if (n == TT_E2EE_NO_SESSION) {
             /* peer speaks the layer but we have no session: start one */
             e2ee_start(t, fn);
+            return true;
+        }
+        if (n == TT_E2EE_DECODE_FAIL) {
+            /* not a valid frame: the peer is a legacy client sending
+               plaintext. Fall back to plaintext for this connection and
+               warn the user (unless E2EE is enforced for this friend). */
+            if (!t->e2ee_required[fn]) {
+                t->e2ee_fallback[fn] = true;
+                e2ee_warn(t, fn,
+                          "This contact does not support end-to-end encryption "
+                          "— messages are sent in plaintext.");
+                return false; /* let the plaintext flow to the consumer */
+            }
+            /* enforced: drop the plaintext, warn once */
+            e2ee_warn(t, fn,
+                      "This contact does not support end-to-end encryption, "
+                      "but E2EE is required for them — plaintext messages are "
+                      "blocked.");
             return true;
         }
         /* undecryptable frame: generic system line, never failure details */
@@ -328,6 +381,73 @@ bool tt_settings_store_proxy(const char *profile_path, const char *host, long po
         fprintf(fp, "proxy %s %ld\n", host, port);
     else
         fputs("noproxy\n", fp);
+    if (fclose(fp) != 0 || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* Per-friend E2EE enforcement sidecar. The "<profile>.tt" file carries one
+   line per setting group; the E2EE line lists enforced friend numbers:
+     e2ee <fn> <fn> ...
+   A missing line means no enforcement. The proxy line (if any) is preserved
+   on write. */
+void tt_settings_load_e2ee(bool required[TT_MAX_FRIENDS], const char *profile_path) {
+    memset(required, 0, TT_MAX_FRIENDS * sizeof(bool));
+    if (!profile_path) return;
+    char path[strlen(profile_path) + 4];
+    sprintf(path, "%s.tt", profile_path);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return;
+    char line[512];
+    while (fgets(line, sizeof line, fp)) {
+        if (strncmp(line, "e2ee", 4) != 0) continue;
+        char *p = line + 4;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p < '0' || *p > '9') break;
+            char *end = NULL;
+            long fn = strtol(p, &end, 10);
+            if (end == p) break;
+            if (fn >= 0 && fn < TT_MAX_FRIENDS) required[fn] = true;
+            p = end;
+        }
+        break;
+    }
+    fclose(fp);
+}
+
+bool tt_settings_store_e2ee(const bool required[TT_MAX_FRIENDS],
+                             const char *profile_path) {
+    if (!profile_path) return false;
+    char path[strlen(profile_path) + 4];
+    sprintf(path, "%s.tt", profile_path);
+    char tmp[strlen(profile_path) + 8];
+    sprintf(tmp, "%s.tt.new", profile_path);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) return false;
+    /* preserve the proxy line if present */
+    FILE *old = fopen(path, "rb");
+    if (old) {
+        char line[128];
+        if (fgets(line, sizeof line, old)) {
+            if (strncmp(line, "proxy", 5) == 0 || strncmp(line, "noproxy", 7) == 0)
+                fputs(line, fp);
+        }
+        fclose(old);
+    }
+    /* write the enforced friend numbers (true entries only) */
+    int first = 1;
+    for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++) {
+        if (!required[fn]) continue;
+        if (first) {
+            fputs("e2ee", fp);
+            first = 0;
+        }
+        fprintf(fp, " %u", fn);
+    }
+    if (!first) fputc('\n', fp);
     if (fclose(fp) != 0 || rename(tmp, path) != 0) {
         unlink(tmp);
         return false;
@@ -1270,38 +1390,56 @@ static void offline_flush_friend(TTToxThread *t, uint32_t fn) {
         TTE2EEEnv env;
         e2ee_env(t, fn, &env);
         if (env.peer_pk) {
-            uint8_t frame[TT_FRAME_MAX];
-            for (int i = 0; i < n; i++) {
-                size_t len = strlen(texts[i]);
-                size_t off = 0;
-                while (off < len) {
-                    size_t chunk = len - off;
-                    if (chunk > TT_E2EE_CHUNK) chunk = TT_E2EE_CHUNK;
-                    int sn = tt_session_send(&t->e2ee[fn], &env,
-                                             (const uint8_t *)texts[i] + off,
-                                             chunk, frame, sizeof frame);
-                    if (sn < 0) break;
-                    if (sn == 0) {
-                        /* inactive session: the chunk is stashed for the
-                           post-handshake flush; requeue only what the stash
-                           did not take (multi-chunk texts) */
-                        if (off + chunk < len)
-                            tt_oq_add(&t->oq, fn, texts[i] + off + chunk);
-                        off = len;
+            TTSession *s = &t->e2ee[fn];
+            if (!s->active && e2ee_fallback_due(t, fn)) {
+                /* legacy friend: enforced -> block the flush; else fall back
+                   to plaintext with a warning */
+                if (t->e2ee_required[fn]) {
+                    e2ee_warn(t, fn,
+                              "E2EE is required for this contact, but they do "
+                              "not support it — queued messages not sent.");
+                    tt_oq_save(&t->oq, t->profile_path, t->pass_key);
+                    return;
+                }
+                t->e2ee_fallback[fn] = true;
+                e2ee_warn(t, fn,
+                          "This contact does not support end-to-end encryption "
+                          "— queued messages sent in plaintext.");
+                /* fall through to the plain flush below */
+            } else {
+                uint8_t frame[TT_FRAME_MAX];
+                for (int i = 0; i < n; i++) {
+                    size_t len = strlen(texts[i]);
+                    size_t off = 0;
+                    while (off < len) {
+                        size_t chunk = len - off;
+                        if (chunk > TT_E2EE_CHUNK) chunk = TT_E2EE_CHUNK;
+                        int sn = tt_session_send(&t->e2ee[fn], &env,
+                                                 (const uint8_t *)texts[i] + off,
+                                                 chunk, frame, sizeof frame);
+                        if (sn < 0) break;
+                        if (sn == 0) {
+                            /* inactive session: the chunk is stashed for the
+                               post-handshake flush; requeue only what the stash
+                               did not take (multi-chunk texts) */
+                            if (off + chunk < len)
+                                tt_oq_add(&t->oq, fn, texts[i] + off + chunk);
+                            off = len;
+                            break;
+                        }
+                        if (e2ee_send_frame(t, fn, frame, (size_t)sn) == 0)
+                            break; /* friend dropped mid-flush: requeue the rest */
+                        off += chunk;
+                    }
+                    if (off < len) { /* session lost mid-text: requeue the rest */
+                        for (int k = i; k < n; k++) tt_oq_add(&t->oq, fn, texts[k]);
                         break;
                     }
-                    if (e2ee_send_frame(t, fn, frame, (size_t)sn) == 0)
-                        break; /* friend dropped mid-flush: requeue the rest */
-                    off += chunk;
                 }
-                if (off < len) { /* session lost mid-text: requeue the rest */
-                    for (int k = i; k < n; k++) tt_oq_add(&t->oq, fn, texts[k]);
-                    break;
-                }
+                tt_oq_save(&t->oq, t->profile_path, t->pass_key);
+                push_simple(t, TT_EV_OFFLINE_FLUSHED, fn, NULL, 0, n);
+                return;
             }
-            tt_oq_save(&t->oq, t->profile_path, t->pass_key);
-            push_simple(t, TT_EV_OFFLINE_FLUSHED, fn, NULL, 0, n);
-            return;
         }
     }
     for (int i = 0; i < n; i++) {
@@ -1419,6 +1557,14 @@ static void cb_friend_connection(Tox *tox, uint32_t friend_number, Tox_Connectio
     if (connection != TOX_CONNECTION_NONE) {
         emit_friend_identity(t, friend_number);
         avatar_push_to_friend(t, friend_number);
+        /* E2EE layer: a fresh connection re-evaluates legacy status — clear
+           the fallback/warn flags so a legacy friend is re-detected (and
+           re-warned) on each reconnect, and a friend who upgraded to E2EE
+           stops falling back. */
+        if (tt_e2ee_mode && t->e2ee && friend_number < TT_MAX_FRIENDS) {
+            t->e2ee_fallback[friend_number] = false;
+            t->e2ee_warned[friend_number] = false;
+        }
         if (tt_oq_count(&t->oq, friend_number) > 0 && !t->oq_flushing)
             offline_flush_friend(t, friend_number);
         /* E2EE layer: kick the in-band handshake when a friend comes
@@ -1709,41 +1855,59 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
             e2ee_env(t, ev->friend_number, &env);
             TTSession *s = &t->e2ee[ev->friend_number];
             if (env.peer_pk) {
-                /* texts > chunk emit consecutive frames, each a message line */
-                uint8_t out[TT_FRAME_MAX];
-                size_t len = ev->str_len;
-                size_t off = 0;
-                while (off < len) {
-                    size_t chunk = len - off;
-                    if (chunk > TT_E2EE_CHUNK) chunk = TT_E2EE_CHUNK;
-                    int n = tt_session_send(s, &env, (const uint8_t *)ev->str + off,
-                                            chunk, out, sizeof out);
-                    if (n < 0) {
-                        TT_LOG("e2ee", "send(%u): %d", ev->friend_number, n);
+                if (!s->active && e2ee_fallback_due(t, ev->friend_number)) {
+                    /* the handshake never landed: this friend is a legacy
+                       client. Enforced friends are blocked; others fall back
+                       to plaintext with a warning. */
+                    if (t->e2ee_required[ev->friend_number]) {
+                        e2ee_warn(t, ev->friend_number,
+                                  "E2EE is required for this contact, but they "
+                                  "do not support it — message not sent.");
                         break;
                     }
-                    if (n > 0) {
-                        uint32_t mid = e2ee_send_frame(t, ev->friend_number,
-                                                       out, (size_t)n);
-                        if (mid) {
-                            /* receipt key for the encrypted text (same
-                               contract as the plain path) */
-                            push_simple(t, TT_EV_MESSAGE_SENT, ev->friend_number,
-                                        NULL, 0, (int)mid);
-                        } else {
-                            break; /* friend dropped: requeue the tail below */
+                    t->e2ee_fallback[ev->friend_number] = true;
+                    e2ee_warn(t, ev->friend_number,
+                              "This contact does not support end-to-end "
+                              "encryption — message sent in plaintext.");
+                    /* fall through to the plain path below */
+                } else {
+                    /* texts > chunk emit consecutive frames, each a message line */
+                    uint8_t out[TT_FRAME_MAX];
+                    size_t len = ev->str_len;
+                    size_t off = 0;
+                    while (off < len) {
+                        size_t chunk = len - off;
+                        if (chunk > TT_E2EE_CHUNK) chunk = TT_E2EE_CHUNK;
+                        int n = tt_session_send(s, &env, (const uint8_t *)ev->str + off,
+                                                chunk, out, sizeof out);
+                        if (n < 0) {
+                            TT_LOG("e2ee", "send(%u): %d", ev->friend_number, n);
+                            break;
                         }
+                        if (n > 0) {
+                            uint32_t mid = e2ee_send_frame(t, ev->friend_number,
+                                                           out, (size_t)n);
+                            if (mid) {
+                                /* receipt key for the encrypted text (same
+                                   contract as the plain path) */
+                                push_simple(t, TT_EV_MESSAGE_SENT, ev->friend_number,
+                                            NULL, 0, (int)mid);
+                            } else {
+                                break; /* friend dropped: requeue the tail below */
+                            }
+                        }
+                        off += chunk; /* n == 0: stashed, flush follows handshake */
                     }
-                    off += chunk; /* n == 0: stashed, flush follows handshake */
+                    if (off < len) { /* send failed mid-way: keep the tail queued */
+                        tt_oq_add(&t->oq, ev->friend_number, ev->str + off);
+                        tt_oq_save(&t->oq, t->profile_path, t->pass_key);
+                    }
+                    break;
                 }
-                if (off < len) { /* send failed mid-way: keep the tail queued */
-                    tt_oq_add(&t->oq, ev->friend_number, ev->str + off);
-                    tt_oq_save(&t->oq, t->profile_path, t->pass_key);
-                }
-                break;
             }
-            /* no friend key: fall through to the plain path (will fail there
-               too, but keeps the normal error behavior) */
+            /* no friend key, or legacy fallback: plain path (will fail there
+               too if the friend is offline, but keeps the normal error
+               behavior) */
         }
         Tox_Err_Friend_Send_Message serr;
         /* ival2: Tox_Message_Type (0 NORMAL, 1 ACTION for "/me ");
@@ -2195,6 +2359,19 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
         TT_LOG("e2ee", "replay: re-inject -> %d (expect %d)", r, TT_E2EE_REPLAY);
         break;
     }
+    case TT_CMD_E2EE_ENFORCE: {
+        /* per-friend E2EE enforcement toggle: persist in the settings sidecar
+           and apply immediately. Enforcing blocks the plaintext fallback for
+           this friend (both send and receive). */
+        if (ev->friend_number >= TT_MAX_FRIENDS) break;
+        t->e2ee_required[ev->friend_number] = (ev->ival != 0);
+        if (!tt_settings_store_e2ee(t->e2ee_required, t->profile_path))
+            TT_LOG("tox", "e2ee enforce(%u): failed to persist sidecar",
+                   ev->friend_number);
+        TT_LOG("tox", "e2ee enforce(%u): %s", ev->friend_number,
+               t->e2ee_required[ev->friend_number] ? "required" : "allowed");
+        break;
+    }
     default:
         TT_LOG("tox", "unknown command %d", (int)ev->type);
         break;
@@ -2362,12 +2539,34 @@ static uint8_t *savedata_strip_dht(const uint8_t *buf, size_t len, size_t *out_l
 
 /* Acquire the at-rest passphrase (mandatory encryption). Returns a malloc'd
    NUL-terminated string the caller wipes+frees, or NULL on failure.
-   Priority: TT_PASSPHRASE env (headless/automation), else an interactive
-   getpass prompt. A non-tty run without TT_PASSPHRASE is fatal — we refuse
-   to start rather than silently write a plaintext identity. */
-static char *tt_passphrase_acquire(void) {
+   Priority: TT_PASSPHRASE env (headless/automation), else in GUI mode a
+   Tk dialog (the tox thread posts TT_EV_PASSPHRASE_NEEDED and blocks until
+   the UI thread replies), else an interactive getpass prompt. A non-tty,
+   non-GUI run without TT_PASSPHRASE is fatal — we refuse to start rather
+   than silently write a plaintext identity. */
+static char *tt_passphrase_acquire(TTToxThread *t) {
     const char *env = getenv("TT_PASSPHRASE");
     if (env && env[0]) return strdup(env);
+    if (t->gui_mode) {
+        /* Ask the UI thread for the passphrase. The UI owns the dialog; we
+           just post the request and wait. */
+        TTEvent *ev = tt_event_new(TT_EV_PASSPHRASE_NEEDED);
+        if (ev) tt_queue_push(&t->out, ev);
+        pthread_mutex_lock(&t->pass_lock);
+        t->pass_waiting = true;
+        while (!t->pass_buf && !t->pass_cancel)
+            pthread_cond_wait(&t->pass_cond, &t->pass_lock);
+        t->pass_waiting = false;
+        char *pass = t->pass_buf; /* ownership transfers to the caller */
+        t->pass_buf = NULL;
+        bool cancelled = t->pass_cancel;
+        pthread_mutex_unlock(&t->pass_lock);
+        if (cancelled) {
+            TT_LOG("tox", "passphrase dialog cancelled — refusing to start");
+            return NULL;
+        }
+        return pass;
+    }
     if (isatty(STDIN_FILENO)) {
         char *p = getpass("TkTox profile passphrase: ");
         if (p) return strdup(p);
@@ -2452,20 +2651,24 @@ static void *tox_thread_main(void *arg) {
         }
     }
 
-    /* At-rest encryption (mandatory): derive the scrypt pass-key once and
-       reuse it for every profile/offline-queue save. The passphrase is
-       wiped after derivation; the derived key lives in t->pass_key.
-       tox_pass_key_derive uses a RANDOM salt, so for an existing profile we
-       must derive from the salt embedded in the savedata (tox_get_salt) or
-       the key will never match. A fresh profile gets a fresh random salt. */
+    /* At-rest encryption (mandatory): acquire the passphrase ONCE and derive
+       both keys from it — the profile/offline-queue key and the session
+       sidecar key. The two keys use DISTINCT random salts so they are
+       cryptographically independent (a leaked profile key cannot decrypt
+       the session sidecar and vice versa). The passphrase is wiped after
+       both derivations; the derived keys live in t->pass_key and
+       t->session_key. tox_pass_key_derive uses a RANDOM salt, so for an
+       existing profile/sidecar we must derive from the salt embedded in the
+       savedata (tox_get_salt) or the key will never match. A fresh
+       profile/sidecar gets a fresh random salt. */
+    char *pass = tt_passphrase_acquire(t);
+    if (!pass) {
+        tox_options_free(opts);
+        TTEvent *ev = tt_event_new(TT_EV_SHUTDOWN);
+        if (ev) tt_queue_push(&t->out, ev);
+        return NULL;
+    }
     {
-        char *pass = tt_passphrase_acquire();
-        if (!pass) {
-            tox_options_free(opts);
-            TTEvent *ev = tt_event_new(TT_EV_SHUTDOWN);
-            if (ev) tt_queue_push(&t->out, ev);
-            return NULL;
-        }
         Tox_Err_Key_Derivation kerr;
         Tox_Pass_Salt salt;
         bool have_salt = false;
@@ -2488,10 +2691,10 @@ static void *tox_thread_main(void *arg) {
             t->pass_key = tox_pass_key_derive(
                 (const uint8_t *)pass, strlen(pass), &kerr);
         }
-        sodium_memzero(pass, strlen(pass));
-        free(pass);
         if (!t->pass_key) {
             TT_LOG("tox", "pass-key derivation failed: %d", (int)kerr);
+            sodium_memzero(pass, strlen(pass));
+            free(pass);
             tox_options_free(opts);
             TTEvent *ev = tt_event_new(TT_EV_SHUTDOWN);
             if (ev) tt_queue_push(&t->out, ev);
@@ -2500,23 +2703,7 @@ static void *tox_thread_main(void *arg) {
         TT_LOG("tox", "at-rest encryption: ON (scrypt pass-key derived%s)",
                have_salt ? " from profile salt" : "");
     }
-
-    /* Session sidecar at-rest key: derived from the SAME passphrase but a
-       DISTINCT random salt, so the profile key and the session key are
-       cryptographically independent (a leaked profile key cannot decrypt
-       the session sidecar and vice versa). The salt is embedded in the
-       toxencryptsave blob of "<profile>.ses"; for an existing sidecar we
-       must derive from THAT salt (tox_pass_key_derive uses a fresh random
-       salt each call and would never match), falling back to a fresh salt
-       when no sidecar exists yet. */
     {
-        char *pass = tt_passphrase_acquire();
-        if (!pass) {
-            tox_options_free(opts);
-            TTEvent *ev = tt_event_new(TT_EV_SHUTDOWN);
-            if (ev) tt_queue_push(&t->out, ev);
-            return NULL;
-        }
         Tox_Err_Key_Derivation kerr;
         Tox_Pass_Salt salt;
         bool have_salt = false;
@@ -2541,10 +2728,10 @@ static void *tox_thread_main(void *arg) {
             t->session_key = tox_pass_key_derive(
                 (const uint8_t *)pass, strlen(pass), &kerr);
         }
-        sodium_memzero(pass, strlen(pass));
-        free(pass);
         if (!t->session_key) {
             TT_LOG("tox", "session key derivation failed: %d", (int)kerr);
+            sodium_memzero(pass, strlen(pass));
+            free(pass);
             tox_options_free(opts);
             TTEvent *ev = tt_event_new(TT_EV_SHUTDOWN);
             if (ev) tt_queue_push(&t->out, ev);
@@ -2553,6 +2740,8 @@ static void *tox_thread_main(void *arg) {
         TT_LOG("tox", "session at-rest key: ON (distinct salt%s)",
                have_salt ? " from sidecar salt" : "");
     }
+    sodium_memzero(pass, strlen(pass));
+    free(pass);
 
     /* Both at-rest keys are derived; drop the passphrase from the process
        environment so it is not visible via /proc/<pid>/environ or inherited
@@ -2736,6 +2925,11 @@ static void *tox_thread_main(void *arg) {
             TT_LOG("tox", "e2ee alloc failed — layer DISABLED");
             tt_e2ee_mode = false;
         } else {
+            /* restore per-friend E2EE enforcement from the settings sidecar */
+            tt_settings_load_e2ee(t->e2ee_required, t->profile_path);
+            for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++)
+                if (t->e2ee_required[fn])
+                    push_simple(t, TT_EV_E2EE_ENFORCE, fn, NULL, 0, 1);
             /* v2: restore established sessions so forward secrecy survives
                restarts (only ACTIVE sessions are persisted; pending
                handshakes re-init fresh) */
@@ -2744,6 +2938,15 @@ static void *tox_thread_main(void *arg) {
             for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++)
                 if (t->e2ee[fn].active) {
                     restored++;
+                    /* a restored session means E2EE already worked with this
+                       friend — auto-enforce it going forward (same rule as a
+                       fresh handshake) */
+                    if (!t->e2ee_required[fn]) {
+                        t->e2ee_required[fn] = true;
+                        if (!tt_settings_store_e2ee(t->e2ee_required, t->profile_path))
+                            TT_LOG("tox", "e2ee auto-enforce(%u): persist failed", fn);
+                        push_simple(t, TT_EV_E2EE_ENFORCE, fn, NULL, 0, 1);
+                    }
                     /* tell the UI about the restored session (lock badge +
                        verification code); a fresh handshake emits this via
                        e2ee_rx, but a restored session has no handshake */
@@ -2821,13 +3024,18 @@ static void *tox_thread_main(void *arg) {
     return NULL;
 }
 
-bool tt_tox_thread_start(TTToxThread *t, const char *profile_path) {
+bool tt_tox_thread_start(TTToxThread *t, const char *profile_path, bool gui_mode) {
     memset(t, 0, sizeof *t);
     tt_queue_init(&t->out);
     tt_queue_init(&t->in);
+    pthread_mutex_init(&t->pass_lock, NULL);
+    pthread_cond_init(&t->pass_cond, NULL);
+    t->gui_mode = gui_mode;
     if (profile_path) {
         t->profile_path = strdup(profile_path);
         if (!t->profile_path) {
+            pthread_cond_destroy(&t->pass_cond);
+            pthread_mutex_destroy(&t->pass_lock);
             tt_queue_destroy(&t->in);
             tt_queue_destroy(&t->out);
             return false;
@@ -2842,5 +3050,7 @@ void tt_tox_thread_stop(TTToxThread *t) {
     pthread_join(t->thread, NULL);
     tt_queue_destroy(&t->in);
     tt_queue_destroy(&t->out);
+    pthread_cond_destroy(&t->pass_cond);
+    pthread_mutex_destroy(&t->pass_lock);
     free(t->profile_path);
 }

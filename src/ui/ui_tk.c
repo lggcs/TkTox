@@ -18,6 +18,7 @@
 #include <tcl.h>
 #include <tk.h>
 #include <tox/toxav.h>
+#include <sodium.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -92,6 +93,8 @@ typedef struct Contact {
                                 (button shows Cancel; false on AV_STATE/ENDED) */
     bool e2ee;               /* M5: encrypted session established (🔒 badge) */
     char e2ee_code[33];      /* M5: 32-hex verification code (established) */
+    bool e2ee_required;      /* M5: require E2EE for this friend (block plaintext
+                                fallback); persisted in the settings sidecar */
     struct Contact *next;
 } Contact;
 
@@ -159,6 +162,7 @@ typedef struct Ui {
     bool ginvite_open;
     bool gtopic_open;
     bool gctl_open;          /* group owner/moderation settings dialog */
+    bool pass_open;          /* at-rest passphrase dialog (startup) */
     bool quitting;
     char self_avatar_img[48];
     unsigned avatar_seq;     /* unique Tk photo names: av0, av1, ... */
@@ -1259,6 +1263,9 @@ static void badge_avatar_render(Ui *ui) {
 /* dialog chrome helper (defined with the group dialogs): white toplevel +
    correct-order wm transient so dialogs map above the main window */
 static void dlg_theme(Ui *ui, const char *path);
+/* at-rest passphrase dialog (defined with the group dialogs); opened from
+   handle_event on TT_EV_PASSPHRASE_NEEDED */
+static void pass_dialog_open(Ui *ui);
 
 /* chat-header avatar slot: shown only while a friend with an avatar is
    selected — no standing placeholder glyph. Packs to the RIGHT of the call
@@ -1648,6 +1655,23 @@ static void handle_event(Ui *ui, TTEvent *e) {
             if (ui->sel_kind == TT_SEL_CHAT && ui->sel_fn == e->friend_number)
                 show_selected(ui);
         }
+        break;
+    }
+    case TT_EV_E2EE_WARN: { /* M5: E2EE warning system line (legacy fallback /
+                               enforcement block) */
+        Contact *c = contact_by_fn(ui, e->friend_number);
+        if (!c) c = contact_add(ui, e->friend_number, false);
+        if (!c || !e->str) break;
+        chat_append_sys(c, 1, e->str);
+        if (ui->sel_kind == TT_SEL_CHAT && ui->sel_fn == e->friend_number)
+            show_selected(ui);
+        break;
+    }
+    case TT_EV_E2EE_ENFORCE: { /* M5: per-friend E2EE enforcement state */
+        Contact *c = contact_by_fn(ui, e->friend_number);
+        if (!c) c = contact_add(ui, e->friend_number, false);
+        if (!c) break;
+        c->e2ee_required = (e->ival != 0);
         break;
     }
     case TT_EV_FRIEND_REQUEST:
@@ -2207,6 +2231,9 @@ static void handle_event(Ui *ui, TTEvent *e) {
         show_selected(ui);
         break;
     }
+    case TT_EV_PASSPHRASE_NEEDED:
+        pass_dialog_open(ui);
+        break;
     case TT_EV_SHUTDOWN:
         ui->quitting = true;
         EV("destroy", ".");
@@ -3298,8 +3325,33 @@ static int cc_view_profile(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *con
     EV("ttk::label", ".prof.vc", "-text", vcode, "-foreground", C_MAIN_TEXT,
        "-wraplength", "420", "-justify", "left");
     EV("pack", ".prof.vc", "-side", "top", "-anchor", "w", "-pady", "2");
+    /* M5: per-friend E2EE enforcement. When required, plaintext fallback is
+       blocked for this contact (both directions) — a compromise of a legacy
+       client cannot downgrade the conversation. */
+    EV("ttk::separator", ".prof.sep2", "-orient", "horizontal");
+    EV("pack", ".prof.sep2", "-side", "top", "-fill", "x", "-pady", "6");
+    EV("ttk::checkbutton", ".prof.enf", "-text",
+       "Require end-to-end encryption (block plaintext)",
+       "-variable", "prof_enforce", "-command", "tt_prof_enforce");
+    EV(".prof.enf", "set", c->e2ee_required ? "1" : "0");
+    EV("pack", ".prof.enf", "-side", "top", "-anchor", "w", "-pady", "2");
     EV("ttk::button", ".prof.close", "-text", "Close", "-command", "destroy .prof");
     EV("pack", ".prof.close", "-side", "bottom", "-pady", "8");
+    return TCL_OK;
+}
+
+/* View Profile: toggle per-friend E2EE enforcement (posts the engine command
+   which persists it in the settings sidecar). */
+static int cc_prof_enforce(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->sel_kind != TT_SEL_CHAT) return TCL_OK;
+    Contact *c = contact_by_fn(ui, ui->sel_fn);
+    if (!c) return TCL_OK;
+    EV(".prof.enf", "get");
+    const char *v = Tcl_GetStringResult(ui->interp);
+    int on = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    c->e2ee_required = (on != 0);
+    tt_queue_post(&ui->tt->in, TT_CMD_E2EE_ENFORCE, c->fn, NULL, on);
     return TCL_OK;
 }
 
@@ -3796,6 +3848,75 @@ static void dlg_theme(Ui *ui, const char *path) {
     (void)ui;
 }
 
+/* ---- at-rest passphrase dialog (startup) ----
+   The tox thread blocks on TT_EV_PASSPHRASE_NEEDED until the UI delivers
+   the passphrase (or cancels). The entry is masked; the passphrase is
+   copied out, the entry wiped, and the dialog destroyed before the tox
+   thread is signalled, so the secret never lingers in the widget tree. */
+static void pass_dialog_open(Ui *ui) {
+    if (ui->pass_open) return;
+    ui->pass_open = true;
+    EV("toplevel", ".pw", "-padx", "14", "-pady", "14");
+    EV("wm", "title", ".pw", "TkTox profile passphrase");
+    dlg_theme(ui, ".pw");
+    EV("ttk::label", ".pw.l", "-text",
+       "Enter the passphrase for this profile (at-rest encryption).");
+    EV("ttk::entry", ".pw.e", "-width", "40", "-show", "\xe2\x80\xa2");
+    EV("ttk::frame", ".pw.b");
+    EV("ttk::button", ".pw.ok", "-text", "Unlock", "-command", "tt_pass_ok",
+       "-style", "Green.TButton");
+    EV("ttk::button", ".pw.no", "-text", "Cancel", "-command", "tt_pass_cancel");
+    EV("pack", ".pw.l", "-side", "top", "-anchor", "w", "-pady", "2");
+    EV("pack", ".pw.e", "-side", "top", "-fill", "x", "-pady", "2");
+    EV("pack", ".pw.ok", "-side", "right", "-pady", "8", "-padx", "4");
+    EV("pack", ".pw.no", "-side", "right", "-pady", "8");
+    EV("pack", ".pw.b", "-side", "top", "-anchor", "e");
+    EV("bind", ".pw.e", "<Return>", "tt_pass_ok");
+    EV("wm", "protocol", ".pw", "WM_DELETE_WINDOW", "tt_pass_cancel");
+    EV("focus", ".pw.e");
+}
+
+/* Deliver the passphrase to the tox thread and wake it. */
+static void pass_dialog_deliver(Ui *ui, const char *pass) {
+    pthread_mutex_lock(&ui->tt->pass_lock);
+    if (ui->tt->pass_buf) { /* stale (shouldn't happen): wipe + free */
+        sodium_memzero(ui->tt->pass_buf, strlen(ui->tt->pass_buf));
+        free(ui->tt->pass_buf);
+    }
+    ui->tt->pass_buf = strdup(pass);
+    pthread_cond_signal(&ui->tt->pass_cond);
+    pthread_mutex_unlock(&ui->tt->pass_lock);
+}
+
+static int cc_pass_ok(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (!ui->pass_open) return TCL_OK;
+    EV(".pw.e", "get");
+    /* copy the passphrase out BEFORE the next EV call (stale-result rule) */
+    char pass[256];
+    snprintf(pass, sizeof pass, "%s", Tcl_GetStringResult(ui->interp));
+    if (!pass[0]) return TCL_OK; /* empty: ignore, keep the dialog up */
+    pass_dialog_deliver(ui, pass);
+    sodium_memzero(pass, sizeof pass);
+    ui->pass_open = false;
+    EV(".pw.e", "delete", "0", "end");
+    EV("destroy", ".pw");
+    return TCL_OK;
+}
+
+static int cc_pass_cancel(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (!ui->pass_open) return TCL_OK;
+    pthread_mutex_lock(&ui->tt->pass_lock);
+    ui->tt->pass_cancel = true;
+    pthread_cond_signal(&ui->tt->pass_cond);
+    pthread_mutex_unlock(&ui->tt->pass_lock);
+    ui->pass_open = false;
+    EV(".pw.e", "delete", "0", "end");
+    EV("destroy", ".pw");
+    return TCL_OK;
+}
+
 /* "Members": roster with per-peer moderation, gated by own role.
    Buttons rebuild the row; peer ids are dense so keys are stable. */
 static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
@@ -4257,6 +4378,7 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_remove", cc_remove);
     bind_cmd(&g_ui, "tt_copy_friend_id", cc_copy_friend_id);
     bind_cmd(&g_ui, "tt_view_profile", cc_view_profile);
+    bind_cmd(&g_ui, "tt_prof_enforce", cc_prof_enforce);
     bind_cmd(&g_ui, "tt_roster_menu", cc_roster_menu);
     bind_cmd(&g_ui, "tt_recall", cc_recall);
     bind_cmd(&g_ui, "tt_hist_resize", cc_hist_resize);
@@ -4306,6 +4428,8 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_gignore", cc_gignore);
     bind_cmd(&g_ui, "tt_gleave", cc_gleave);
     bind_cmd(&g_ui, "tt_gcopy_id", cc_gcopy_id);
+    bind_cmd(&g_ui, "tt_pass_ok", cc_pass_ok);
+    bind_cmd(&g_ui, "tt_pass_cancel", cc_pass_cancel);
 
     TT_LOG("tk", "phase: init ok, building widgets");
     build_widgets(&g_ui);

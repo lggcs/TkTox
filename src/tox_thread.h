@@ -69,6 +69,15 @@ typedef enum {
     TT_EV_E2EE_STATE,        /* M3 (TT_E2EE): session with friend_number changed state;
                                 str: 32-hex verification code when ival=1 (established),
                                 NULL/absent when ival=0 (lost/reset) */
+    TT_EV_E2EE_WARN,         /* friend_number: E2EE warning for the chat (str: message).
+                                Emitted once per connection when a friend is detected
+                                as legacy (plaintext fallback) or when enforcement
+                                holds a message pending E2EE. */
+    TT_EV_E2EE_ENFORCE,      /* friend_number, ival: 1 = E2EE required (plaintext
+                                blocked), 0 = fallback allowed. Pushed at startup
+                                for each enforced friend and after a toggle. */
+    TT_EV_PASSPHRASE_NEEDED, /* GUI mode: the tox thread blocks until the UI
+                                provides the at-rest passphrase (or cancels) */
     TT_EV_SHUTDOWN,
 } TTEventType;
 
@@ -131,6 +140,9 @@ typedef enum {
     TT_CMD_E2EE_REPLAY,      /* M4 harness: friend_number; re-inject the last
                                 incoming DATA frame into the local session —
                                 must reject as TT_E2EE_REPLAY */
+    TT_CMD_E2EE_ENFORCE,     /* friend_number, ival: 1 require E2EE (block
+                                plaintext fallback), 0 allow fallback. Persisted
+                                in the settings sidecar. */
 } TTCommandType;
 
 /* TT_CMD_GROUP_SYNC reply burst (reuses existing event types):
@@ -252,9 +264,30 @@ typedef struct TTToxThread {
     struct ToxAV *av;   /* owned by the tox thread (toxav.h); NULL = no AV */
     struct TTAvg *avg;  /* AV engine state (src/av.h); valid only while av set */
     struct TTSession *e2ee; /* TT_MAX_FRIENDS sessions (TT_E2EE only); NULL = off */
+    /* Per-friend E2EE policy (TT_E2EE only). e2ee_required: block plaintext
+       fallback for this friend (persisted in the settings sidecar).
+       e2ee_fallback: we detected this friend as legacy and fell back to
+       plaintext this connection (reset on reconnect; drives the warning).
+       e2ee_handshake_at: when we last kicked the handshake (send-side
+       fallback timeout). e2ee_warned: dedupe the per-connection warning. */
+    bool e2ee_required[TT_MAX_FRIENDS];
+    bool e2ee_fallback[TT_MAX_FRIENDS];
+    time_t e2ee_handshake_at[TT_MAX_FRIENDS];
+    bool e2ee_warned[TT_MAX_FRIENDS];
+    /* At-rest passphrase handshake (GUI mode only): the tox thread posts
+       TT_EV_PASSPHRASE_NEEDED then blocks on pass_cond until the UI thread
+       delivers the passphrase (pass_buf) or cancels (pass_cancel). The
+       passphrase is acquired ONCE and used for both at-rest key derivations,
+       so the UI is never prompted twice. */
+    bool gui_mode;      /* set by tt_tox_thread_start; read by the tox thread */
+    pthread_mutex_t pass_lock;
+    pthread_cond_t  pass_cond;
+    bool pass_waiting;  /* tox thread is blocked awaiting the passphrase */
+    bool pass_cancel;   /* UI cancelled: abort startup */
+    char *pass_buf;     /* UI-provided passphrase (owned by the tox thread) */
 } TTToxThread;
 
-bool tt_tox_thread_start(TTToxThread *t, const char *profile_path);
+bool tt_tox_thread_start(TTToxThread *t, const char *profile_path, bool gui_mode);
 void tt_tox_thread_stop(TTToxThread *t);
 
 /* Settings sidecar: "<profile>.tt" carries client settings that must be
@@ -270,5 +303,14 @@ typedef struct TTSettings {
 void tt_settings_load(TTSettings *s, const char *profile_path);
 /* Atomically write "<profile>.tt"; empty host clears proxy settings. */
 bool tt_settings_store_proxy(const char *profile_path, const char *host, long port);
+/* Per-friend E2EE enforcement: read the "<profile>.tt" sidecar into
+   required[TT_MAX_FRIENDS] (true = require E2EE for that friend number).
+   Missing/malformed file = all false. */
+void tt_settings_load_e2ee(bool required[TT_MAX_FRIENDS], const char *profile_path);
+/* Persist the per-friend E2EE enforcement set (true entries only) into the
+   "<profile>.tt" sidecar, preserving the proxy line. Returns false on I/O
+   failure. */
+bool tt_settings_store_e2ee(const bool required[TT_MAX_FRIENDS],
+                             const char *profile_path);
 
 #endif
