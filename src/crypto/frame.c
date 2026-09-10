@@ -31,6 +31,11 @@ static int expected_hdr_len(uint8_t type, uint8_t flags) {
         }
         if (flags & TT_FRAME_FLAG_PK) return (int)TT_HDR_DATA_KEMPUB;
         return 0;
+    case TT_FRAME_ACK:
+    case TT_FRAME_RESEND:
+        /* reliable-transport control frames: no hdr (like plain DATA) */
+        if (flags & (TT_FRAME_FLAG_KEM | TT_FRAME_FLAG_PK)) return -1;
+        return 0;
     default:
         return -1;
     }

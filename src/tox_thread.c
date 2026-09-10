@@ -95,7 +95,23 @@ static void e2ee_pump(TTToxThread *t, uint32_t fn) {
     }
 }
 
-/* engine tick: INIT retransmits for every pending session */
+/* drain pending reliable-transport control frames (ACK / RESEND request /
+   RESEND reply) for one friend. The engine calls this after every feed and
+   after a re-establishment so recovery control traffic flows promptly. */
+static void e2ee_rel_poll(TTToxThread *t, uint32_t fn) {
+    TTE2EEEnv env;
+    e2ee_env(t, fn, &env);
+    if (!env.peer_pk) return;
+    uint8_t out[TT_FRAME_MAX];
+    for (;;) {
+        int n = tt_session_rel_poll(&t->e2ee[fn], &env, out, sizeof out);
+        if (n <= 0) break;
+        e2ee_send_frame(t, fn, out, (size_t)n);
+    }
+}
+
+/* engine tick: INIT retransmits + pending reliable-transport control
+   frames for every pending session */
 static void e2ee_tick(TTToxThread *t) {
     time_t now = time(NULL);
     for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++) {
@@ -105,6 +121,9 @@ static void e2ee_tick(TTToxThread *t) {
         uint8_t out[TT_FRAME_MAX];
         int n = tt_session_tick(&t->e2ee[fn], &env, now, out, sizeof out);
         if (n > 0) e2ee_send_frame(t, fn, out, (size_t)n);
+        /* flush any queued ACK / RESEND control frame (e.g. a RESEND
+           request queued by a desync whose reply needs a nudge) */
+        e2ee_rel_poll(t, fn);
     }
 }
 
@@ -177,7 +196,13 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
             e2ee_push_state(t, fn, s->active);
         return true;
     }
-    if (n == 0) return true; /* handshake frame consumed silently */
+    if (n == 0) {
+        /* handshake frame consumed silently, or a reliable-transport
+           control frame (ACK / RESEND request). Drain any reply the
+           control frame queued (e.g. a RESEND request -> re-send). */
+        e2ee_rel_poll(t, fn);
+        return true;
+    }
     if (n < 0) {
         TT_LOG("e2ee", "rx(%u): %d", fn, n);
         if (n == TT_E2EE_NO_SESSION) {
@@ -196,6 +221,9 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
             if (s->active) {
                 TT_LOG("e2ee", "session desync(%u): re-establishing", fn);
                 e2ee_start(t, fn);
+                /* the desync set a RESEND request; drain it so the peer
+                   re-sends the lost message under the fresh chain */
+                e2ee_rel_poll(t, fn);
                 return true;
             }
             /* not a valid frame: the peer is a legacy client sending
@@ -240,6 +268,9 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
         memcpy(ev->str, pt, (size_t)n);
         ev->str[n] = '\0';
         ev->str_len = (size_t)n;
+        /* reliable transport: ACK the delivered seq so the peer can evict
+           its buffer; also drains any RESEND reply queued by a request */
+        e2ee_rel_poll(t, fn);
         return false; /* NOT consumed: the normal path displays it */
     }
     TT_LOG("e2ee", "rx(%u): plaintext overflow (%d > %zu)", fn, n, ev->str_len);

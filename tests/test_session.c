@@ -289,6 +289,80 @@ static void test_collision(void) {
     CHECK(strcmp(vcl, vch) == 0);
 }
 
+/* reliable transport: a chain desync (receiver's recv chain diverged) drops
+   the sender's frame; the receiver re-establishes, sends a RESEND request,
+   and the sender re-encrypts its buffered messages under the fresh chain so
+   nothing is lost. */
+static void test_desync_recovery(void) {
+    Peer A, B;
+    peer_init(&A); peer_init(&B); pair_link(&A, &B);
+    CHECK(handshake(&A.s, &A.env, &B.s, &B.env) == 0);
+    bool hs = false;
+    uint8_t got[TT_FRAME_MAX];
+
+    /* A sends m1..m3; B does NOT receive them (dropped on the wire), so
+       they sit in A's reliable buffer tagged with the initial gen */
+    int n1 = tt_session_send(&A.s, &A.env, (const uint8_t *)"m1", 2, fbuf, sizeof fbuf);
+    int n2 = tt_session_send(&A.s, &A.env, (const uint8_t *)"m2", 2, fb2, sizeof fb2);
+    int n3 = tt_session_send(&A.s, &A.env, (const uint8_t *)"m3", 2, fb3, sizeof fb3);
+    CHECK(n1 > 0 && n2 > 0 && n3 > 0);
+    CHECK(A.s.rel.sent.count == 3);
+    uint32_t gen0 = A.s.rel.sent.m[0].gen; /* the initial generation */
+
+    /* B's recv chain diverges (simulated corruption); A's next frame fails */
+    B.s.recv.chain[0] ^= 0xff;
+    int n4 = tt_session_send(&A.s, &A.env, (const uint8_t *)"m4", 2, fbuf, sizeof fbuf);
+    CHECK(n4 > 0);
+    CHECK(tt_session_feed(&B.s, &B.env, fbuf, (size_t)n4, got, sizeof got, &hs)
+          == TT_E2EE_DECODE_FAIL);
+    /* B recorded a RESEND request from its next-expected seq (1) */
+    CHECK(B.s.rel.resend_req_pending);
+    CHECK(B.s.rel.resend_req_gen == gen0 && B.s.rel.resend_req_from == 1);
+
+    /* B re-establishes; the RESEND request survives */
+    int nb = tt_session_start(&B.s, &B.env, fbuf, sizeof fbuf);
+    CHECK(nb > 0);
+    CHECK(B.s.rel.resend_req_pending);
+
+    /* B's INIT makes A (active initiator) yield and re-establish as
+       responder; A's buffer survives */
+    CHECK(tt_session_feed(&A.s, &A.env, fbuf, (size_t)nb, pt, sizeof pt, &hs) == 0);
+    CHECK(hs);
+    CHECK(A.s.rel.sent.count == 4); /* m1..m4 still buffered */
+
+    /* A (now responder) replies; B (initiator) completes the handshake;
+       both active on the fresh generation */
+    int nr = tt_session_reply(&A.s, &A.env, fb2, sizeof fb2);
+    CHECK(nr > 0);
+    CHECK(tt_session_feed(&B.s, &B.env, fb2, (size_t)nr, pt, sizeof pt, &hs) == 0);
+    CHECK(hs);
+    CHECK(A.s.active && B.s.active);
+
+    /* B sends the RESEND request (old gen, from=1); A can now decrypt it */
+    int rr = tt_session_rel_poll(&B.s, &B.env, fbuf, sizeof fbuf);
+    CHECK(rr > 0);
+    CHECK(tt_session_feed(&A.s, &A.env, fbuf, (size_t)rr, pt, sizeof pt, &hs) == 0);
+    CHECK(A.s.rel.resend_rep_pending);
+    CHECK(A.s.rel.resend_rep_gen == gen0 && A.s.rel.resend_rep_from == 1);
+
+    /* A re-sends m1..m4 under the fresh chain; B recovers all four */
+    const char *expect[] = { "m1", "m2", "m3", "m4" };
+    for (int i = 0; i < 4; i++) {
+        int rs = tt_session_rel_poll(&A.s, &A.env, fbuf, sizeof fbuf);
+        CHECK(rs > 0);
+        int rn = tt_session_feed(&B.s, &B.env, fbuf, (size_t)rs, got, sizeof got, &hs);
+        CHECK(rn == 2 && memcmp(got, expect[i], 2) == 0);
+    }
+    /* nothing left to re-send */
+    CHECK(tt_session_rel_poll(&A.s, &A.env, fbuf, sizeof fbuf) <= 0);
+
+    /* B ACKs the recovered messages; A evicts its buffer */
+    int ac = tt_session_rel_poll(&B.s, &B.env, fbuf, sizeof fbuf);
+    CHECK(ac > 0); /* ACK */
+    CHECK(tt_session_feed(&A.s, &A.env, fbuf, (size_t)ac, pt, sizeof pt, &hs) == 0);
+    CHECK(A.s.rel.sent.count == 0);
+}
+
 int main(void) {
     if (sodium_init() < 0) return 2;
     test_layer_switch();
@@ -299,6 +373,7 @@ int main(void) {
     test_stash_flush();
     test_status_paths();
     test_collision();
+    test_desync_recovery();
     if (fails == 0) puts("session: ALL PASS");
     return fails ? 1 : 0;
 }

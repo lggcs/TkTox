@@ -102,7 +102,15 @@ void tt_kdf_msg_material(uint8_t enc_key[TT_KEY32], uint8_t nonce[TT_NONCE24],
 #define TT_FRAME_FLAG_AES_HW 0x04u
 #define TT_FRAME_FLAG_PK     0x08u /* M4: DATA hdr carries our fresh kem pk */
 
-typedef enum { TT_FRAME_INIT = 0, TT_FRAME_REPLY = 1, TT_FRAME_DATA = 2 } TTFrameType;
+typedef enum {
+    TT_FRAME_INIT = 0,
+    TT_FRAME_REPLY = 1,
+    TT_FRAME_DATA = 2,
+    TT_FRAME_ACK = 3,     /* reliable transport: u32 BE acked_seq (highest
+                             contiguous seq delivered) — bounds the sender buffer */
+    TT_FRAME_RESEND = 4,  /* reliable transport: u32 BE gen + u32 BE from_seq —
+                             request re-send of everything since divergence */
+} TTFrameType;
 
 typedef struct {
     TTFrameType type;

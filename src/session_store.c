@@ -102,6 +102,26 @@ static int session_put(Buf *b, const TTSession *s) {
         buf_u8(b, k->post_fold_publish ? 1 : 0) ||
         buf_u8(b, k->publish_back ? 1 : 0))
         return -1;
+    /* reliable transport: unacked sent buffer + ACK/resend state, so
+       recovery survives a restart. The generation is NOT stored — it is
+       derived from the handshake root (rel_gen), so it is always in sync
+       with the restored root. */
+    const TTReliable *r = &s->rel;
+    if (buf_u16(b, r->sent.count))
+        return -1;
+    for (uint16_t i = 0; i < r->sent.count; i++) {
+        const TTSentMsg *m = &r->sent.m[(r->sent.head + i) % TT_SENT_MAX];
+        if (buf_u32(b, m->gen) || buf_u32(b, m->seq) ||
+            buf_u16(b, m->len) || buf_put(b, m->data, m->len))
+            return -1;
+    }
+    if (buf_u32(b, r->recv_acked) || buf_u8(b, r->ack_due ? 1 : 0) ||
+        buf_u8(b, r->resend_req_pending ? 1 : 0) ||
+        buf_u32(b, r->resend_req_gen) || buf_u32(b, r->resend_req_from) ||
+        buf_u8(b, r->resend_rep_pending ? 1 : 0) ||
+        buf_u32(b, r->resend_rep_gen) || buf_u32(b, r->resend_rep_from) ||
+        buf_u16(b, r->resend_rep_pos))
+        return -1;
     return 0;
 }
 
@@ -233,6 +253,48 @@ static int session_get(const uint8_t **p, const uint8_t *end, TTSession *s) {
     k->published = (**p != 0); *p += 1;
     k->post_fold_publish = (**p != 0); *p += 1;
     k->publish_back = (**p != 0); *p += 1;
+    /* reliable transport state (sent buffer + ACK/resend) */
+    TTReliable *r = &s->rel;
+    if (*p + 2 > end) return -1;
+    r->sent.count = (uint16_t)(((uint16_t)(*p)[0] << 8) | (*p)[1]);
+    *p += 2;
+    if (r->sent.count > TT_SENT_MAX) return -1;
+    r->sent.head = 0;
+    for (uint16_t i = 0; i < r->sent.count; i++) {
+        TTSentMsg *m = &r->sent.m[i];
+        if (*p + 4 + 4 + 2 > end) return -1;
+        m->gen = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                 ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+        *p += 4;
+        m->seq = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                 ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+        *p += 4;
+        m->len = (uint16_t)(((uint16_t)(*p)[0] << 8) | (*p)[1]);
+        *p += 2;
+        if (m->len > TT_FRAME_DATA_MAX || *p + m->len > end) return -1;
+        memcpy(m->data, *p, m->len); *p += m->len;
+    }
+    if (*p + 4 + 1 + 1 + 4 + 4 + 1 + 4 + 4 + 2 > end) return -1;
+    r->recv_acked = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                     ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+    *p += 4;
+    r->ack_due = (**p != 0); *p += 1;
+    r->resend_req_pending = (**p != 0); *p += 1;
+    r->resend_req_gen = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                        ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+    *p += 4;
+    r->resend_req_from = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                         ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+    *p += 4;
+    r->resend_rep_pending = (**p != 0); *p += 1;
+    r->resend_rep_gen = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                        ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+    *p += 4;
+    r->resend_rep_from = ((uint32_t)(*p)[0] << 24) | ((uint32_t)(*p)[1] << 16) |
+                         ((uint32_t)(*p)[2] << 8) | (uint32_t)(*p)[3];
+    *p += 4;
+    r->resend_rep_pos = (uint16_t)(((uint16_t)(*p)[0] << 8) | (*p)[1]);
+    *p += 2;
     s->active = true;
     (void)fn;
     return 0;

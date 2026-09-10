@@ -51,6 +51,48 @@
 #define TT_SESSION_SKIPPED_MAX 96u /* skipped (seq, msg_key) store cap; the
    oldest entry is evicted over a newer one (still bounded by maxSkip) */
 
+/* Reliable transport (receiver-driven re-send on chain desync). The sender
+   buffers unacked outgoing plaintext; the receiver ACKs the highest
+   contiguous seq it has decrypted, bounding the buffer. On a desync the
+   receiver re-establishes and sends a RESEND request; the sender re-encrypts
+   the buffered messages under the fresh chain. The generation counter
+   disambiguates the old seq space (where the failed message lives) from the
+   new one, so a re-send never wrongly re-sends fresh messages. */
+#define TT_SENT_MAX 32u /* unacked outgoing messages buffered per direction;
+   evicted by ACK (normal flow) or FIFO when full. The failed message is
+   always the sender's most recent, so 32 recovers any burst that fits.
+   Bounds the persisted sidecar and the fixed 256-session array
+   (32 * 1319B * 256 ≈ 10.8MB). */
+
+typedef struct TTSentMsg {
+    uint32_t gen;   /* session generation at send time */
+    uint32_t seq;   /* ratchet seq at send time */
+    uint16_t len;   /* plaintext length */
+    uint8_t data[TT_FRAME_DATA_MAX];
+} TTSentMsg;
+
+typedef struct TTSentBuf {
+    TTSentMsg m[TT_SENT_MAX];
+    uint16_t head;  /* oldest entry index */
+    uint16_t count; /* number of live entries */
+} TTSentBuf;
+
+/* Reliable-transport state, preserved across re-establishment (like the
+   pending stash) so recovery survives a desync and a restart. The session
+   generation is NOT stored here — it is derived from the handshake root
+   (rel_gen in session.c), so both peers always agree on it even when they
+   re-establish at different times. */
+typedef struct TTReliable {
+    TTSentBuf sent;            /* outgoing unacked messages */
+    uint32_t recv_acked;       /* highest contiguous seq decrypted (for ACK) */
+    bool ack_due;              /* an ACK is pending to send */
+    bool resend_req_pending;   /* we detected a desync; send a RESEND request */
+    uint32_t resend_req_gen, resend_req_from;
+    bool resend_rep_pending;   /* we received a RESEND; re-send buffered msgs */
+    uint32_t resend_rep_gen, resend_rep_from;
+    uint16_t resend_rep_pos;   /* next buffered index to re-send (0..count) */
+} TTReliable;
+
 /* session-level failure codes (the UI shows one generic line; the code
    only ever reaches logs) */
 typedef enum {
@@ -133,6 +175,9 @@ typedef struct TTSession {
     uint8_t last_in[TT_FRAME_MAX];
     uint16_t last_in_len;
     bool no_session_notified;    /* undecryptable-frame system line shown once */
+    /* reliable transport (receiver-driven re-send on desync); preserved
+       across re-establishment so recovery survives a desync and a restart */
+    TTReliable rel;
     /* outgoing texts stashed while init_pending; flushed in order */
     uint8_t n_pending;
     struct {
@@ -188,6 +233,15 @@ int tt_session_flush(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t ca
    to do this tick. */
 int tt_session_tick(TTSession *s, const TTE2EEEnv *env, time_t now,
                     uint8_t *out, size_t cap);
+
+/* ---- reliable transport (receiver-driven re-send on desync) ---- */
+
+/* Build the next pending reliable-transport control frame (ACK or RESEND
+   request/reply) into out, if any. Returns the frame length (>0 = send it)
+   or <= 0 when nothing is pending. The engine calls this after every feed
+   and after a re-establishment. */
+int tt_session_rel_poll(TTSession *s, const TTE2EEEnv *env, uint8_t *out,
+                        size_t cap);
 
 /* ---- M4 ratchet engine hooks ---- */
 

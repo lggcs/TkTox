@@ -145,6 +145,111 @@ void tt_session_init(TTSession *s) { memset(s, 0, sizeof *s); }
 
 void tt_session_clear(TTSession *s) { sodium_memzero(s, sizeof *s); }
 
+/* ---- reliable transport (receiver-driven re-send on chain desync) ---- */
+
+/* preserve stashed texts + reliable-transport state across a re-establish.
+   The generation is NOT bumped here — it is derived from the fresh root
+   (rel_gen), so both peers agree on it automatically. The resend request
+   (if any) keeps the OLD gen so the peer re-sends the right messages; the
+   sent buffer keeps its entries' original gens. */
+static void reestablish_preserve(TTSession *s) {
+    TTReliable rel = s->rel;
+    uint8_t stash[sizeof s->pending];
+    uint8_t np = s->n_pending;
+    memcpy(stash, s->pending, sizeof stash);
+    tt_session_clear(s);
+    memcpy(s->pending, stash, sizeof stash);
+    s->n_pending = np;
+    s->rel = rel;
+}
+
+/* buffer one outgoing message tagged {gen, seq}; FIFO-evicts the oldest
+   when full (the failed message is always the most recent, so 32 recovers
+   any burst that fits) */
+static void rel_sent_add(TTSession *s, uint32_t gen, uint32_t seq,
+                         const uint8_t *text, size_t len) {
+    TTSentBuf *b = &s->rel.sent;
+    if (b->count >= TT_SENT_MAX) {
+        uint16_t old = b->head;
+        sodium_memzero(&b->m[old], sizeof b->m[old]);
+        b->head = (b->head + 1) % TT_SENT_MAX;
+        b->count--;
+    }
+    uint16_t idx = (b->head + b->count) % TT_SENT_MAX;
+    b->m[idx].gen = gen;
+    b->m[idx].seq = seq;
+    b->m[idx].len = (uint16_t)len;
+    memcpy(b->m[idx].data, text, len);
+    b->count++;
+}
+
+/* evict buffered messages the peer has delivered (gen==g && seq<=acked) */
+static void rel_sent_ack(TTSession *s, uint32_t g, uint32_t acked) {
+    TTSentBuf *b = &s->rel.sent;
+    uint16_t w = 0;
+    for (uint16_t r = 0; r < b->count; r++) {
+        uint16_t idx = (b->head + r) % TT_SENT_MAX;
+        if (b->m[idx].gen == g && b->m[idx].seq <= acked) {
+            sodium_memzero(&b->m[idx], sizeof b->m[idx]);
+            continue;
+        }
+        if (w != r) {
+            uint16_t widx = (b->head + w) % TT_SENT_MAX;
+            b->m[widx] = b->m[idx];
+            sodium_memzero(&b->m[idx], sizeof b->m[idx]);
+        }
+        w++;
+    }
+    b->count = w;
+}
+
+/* remove one specific buffered message (used after a re-send) */
+static void rel_sent_remove(TTSession *s, uint32_t gen, uint32_t seq) {
+    TTSentBuf *b = &s->rel.sent;
+    uint16_t w = 0;
+    for (uint16_t r = 0; r < b->count; r++) {
+        uint16_t idx = (b->head + r) % TT_SENT_MAX;
+        if (b->m[idx].gen == gen && b->m[idx].seq == seq) {
+            sodium_memzero(&b->m[idx], sizeof b->m[idx]);
+            continue;
+        }
+        if (w != r) {
+            uint16_t widx = (b->head + w) % TT_SENT_MAX;
+            b->m[widx] = b->m[idx];
+            sodium_memzero(&b->m[idx], sizeof b->m[idx]);
+        }
+        w++;
+    }
+    b->count = w;
+}
+
+/* control-frame key: KDF(root, "tt-e2ee-ctl"). Both sides derive the same
+   key from their current root, so a control frame is bound to the session
+   it was sent in — a stale frame from a previous generation (old root)
+   fails to decrypt and is dropped, never misapplied to the new seq space. */
+static void control_key(TTSession *s, uint8_t out[TT_KEY32]) {
+    uint8_t ikm[TT_KEY32 + 1];
+    memcpy(ikm, s->root, TT_KEY32);
+    ikm[TT_KEY32] = 0x01;
+    tt_kdf_root(out, ikm, sizeof ikm, (const uint8_t *)"tt-e2ee-ctl", 12);
+    sodium_memzero(ikm, sizeof ikm);
+}
+
+/* session generation: a 32-bit tag derived from the handshake root. Both
+   peers derive the SAME value from the shared root, so the generation is
+   synchronized (unlike a per-side counter, which drifts when the two sides
+   re-establish at different times). It changes on every re-establishment
+   (new root), disambiguating the old seq space (where the failed message
+   lives) from the new one. */
+static uint32_t rel_gen(const TTSession *s) {
+    uint8_t g[TT_KEY32];
+    derive_from_root(g, s->root, "tt-e2ee-gen");
+    uint32_t v = ((uint32_t)g[0] << 24) | ((uint32_t)g[1] << 16) |
+                 ((uint32_t)g[2] << 8) | (uint32_t)g[3];
+    sodium_memzero(g, sizeof g);
+    return v;
+}
+
 /* verification code from the HANDSHAKE ROOT (direction-independent, so
    both peers derive the same 32 hex chars; stays stable while M4 ratchet
    advances re-key the per-direction roots) */
@@ -220,14 +325,11 @@ int tt_session_start(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t ca
     sodium_init_once();
     if (!env->self_sk || !env->self_pk || !env->peer_pk) return TT_E2EE_NOKEY;
 
-    /* reset any stale state but keep stashed texts (typed while a previous
-       handshake was pending) — they flush over the new session */
-    uint8_t stash[sizeof s->pending];
-    uint8_t np = s->n_pending;
-    memcpy(stash, s->pending, sizeof stash);
-    tt_session_clear(s);
-    memcpy(s->pending, stash, sizeof stash);
-    s->n_pending = np;
+    /* reset any stale state but keep stashed texts + reliable-transport
+       state (typed while a previous handshake was pending) — they flush
+       over the new session; the generation bumps so the old seq space is
+       stale */
+    reestablish_preserve(s);
     s->i_am_initiator = true;
     s->init_pending = true;
     s->init_at = time(NULL);
@@ -325,13 +427,9 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
         if (s->i_am_initiator && (s->active || s->init_pending)) {
             if (s->active || memcmp(d.hdr, env->self_pk, TT_KEY32) < 0) {
                 /* peer is the lower pk (or we are established): yield,
-                   re-run as responder */
-                uint8_t stash[sizeof s->pending];
-                uint8_t np = s->n_pending;
-                memcpy(stash, s->pending, sizeof stash);
-                tt_session_clear(s);
-                memcpy(s->pending, stash, sizeof stash);
-                s->n_pending = np;
+                   re-run as responder (stashed texts + reliable state
+                   survive; generation bumps) */
+                reestablish_preserve(s);
             } else {
                 return 0; /* lower pk: our INIT carries the session */
             }
@@ -410,6 +508,34 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
         return 0;
     }
 
+    /* ---- reliable-transport control frames (ACK / RESEND) ---- */
+    if (d.type == TT_FRAME_ACK || d.type == TT_FRAME_RESEND) {
+        if (!s->active) return TT_E2EE_NO_SESSION;
+        if (d.hdr_len != 0) return TT_E2EE_DECODE_FAIL;
+        uint8_t ck[TT_KEY32], scratch[16];
+        control_key(s, ck);
+        int n = tt_frame_decode(in, in_len, ck, &d, scratch, sizeof scratch);
+        sodium_memzero(ck, sizeof ck);
+        if (n < 0) return TT_E2EE_DECODE_FAIL; /* stale gen or corrupt */
+        if (n != 8) return TT_E2EE_DECODE_FAIL; /* exactly two u32s */
+        uint32_t a = ((uint32_t)scratch[0] << 24) | ((uint32_t)scratch[1] << 16) |
+                     ((uint32_t)scratch[2] << 8) | (uint32_t)scratch[3];
+        uint32_t b = ((uint32_t)scratch[4] << 24) | ((uint32_t)scratch[5] << 16) |
+                     ((uint32_t)scratch[6] << 8) | (uint32_t)scratch[7];
+        if (d.type == TT_FRAME_ACK) {
+            /* peer delivered up to seq `a` in generation `b`; evict */
+            rel_sent_ack(s, b, a);
+        } else {
+            /* peer lost its chain at gen `a`, seq `b`; re-send buffered
+               messages from that generation/seq under the fresh chain */
+            s->rel.resend_rep_pending = true;
+            s->rel.resend_rep_gen = a;
+            s->rel.resend_rep_from = b;
+            s->rel.resend_rep_pos = 0;
+        }
+        return 0;
+    }
+
     /* ---- DATA (M4 ratchet receive) ---- */
     if (!s->active) return TT_E2EE_NO_SESSION;
     if (d.hdr_len != 0 && d.hdr_len != TT_HDR_DATA_REKEY &&
@@ -439,6 +565,16 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
         if (from_ring) skipped_add(&s->recv, d.seq, key);
         sodium_memzero(key, sizeof key);
         sodium_memzero(nonce, sizeof nonce);
+        /* chain desync: remember the failed seq so the engine can re-send
+           it after re-establishing (receiver-driven recovery). The re-send
+           must start at the receiver's next-expected seq (recv.seq), not
+           the failed frame's seq — messages between them may have been
+           dropped on the wire and are missing too. */
+        if (s->active) {
+            s->rel.resend_req_pending = true;
+            s->rel.resend_req_gen = rel_gen(s);
+            s->rel.resend_req_from = s->recv.seq;
+        }
         return TT_E2EE_DECODE_FAIL;
     }
 
@@ -457,6 +593,13 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
         tt_kdf_chain_step(nc, mk, s->recv.chain);
         memcpy(s->recv.chain, nc, TT_KEY32);
         s->recv.seq++;
+    }
+
+    /* reliable transport: the highest contiguous seq delivered is now
+       recv.seq-1; mark an ACK due so the peer can evict its buffer */
+    if (s->recv.seq - 1 > s->rel.recv_acked) {
+        s->rel.recv_acked = s->recv.seq - 1;
+        s->rel.ack_due = true;
     }
 
     /* apply re-key material (after decrypt; the REKEY frame itself was
@@ -557,6 +700,10 @@ static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
     sodium_memzero(hdr, sizeof hdr);
     if (n < 0) return TT_E2EE_BAD_STATE;
 
+    /* reliable transport: buffer the plaintext tagged {gen, seq} so a
+       desync re-send can recover it under the fresh chain */
+    rel_sent_add(s, rel_gen(s), seq, text, len);
+
     if (do_fold) {
         ratchet_fold(&s->send, fold_dh, fold_ss);
         /* regenerate our keys and publish them next frame */
@@ -600,6 +747,90 @@ int tt_session_flush(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t ca
     for (int i = 1; i < s->n_pending; i++) s->pending[i - 1] = s->pending[i];
     s->n_pending--;
     return n;
+}
+
+/* ---- reliable transport: build the next pending control frame ---- */
+
+int tt_session_rel_poll(TTSession *s, const TTE2EEEnv *env, uint8_t *out,
+                        size_t cap) {
+    (void)env;
+    if (!s->active) return 0;
+    uint8_t ck[TT_KEY32], nonce[TT_NONCE24], payload[8];
+    int n = 0;
+
+    /* 1. RESEND request (we detected a desync): ask the peer to re-send
+       everything from gen/from_seq onward. Sent once; the peer's re-sends
+       are the recovery. */
+    if (s->rel.resend_req_pending) {
+        s->rel.resend_req_pending = false;
+        payload[0] = (uint8_t)(s->rel.resend_req_gen >> 24);
+        payload[1] = (uint8_t)(s->rel.resend_req_gen >> 16);
+        payload[2] = (uint8_t)(s->rel.resend_req_gen >> 8);
+        payload[3] = (uint8_t)s->rel.resend_req_gen;
+        payload[4] = (uint8_t)(s->rel.resend_req_from >> 24);
+        payload[5] = (uint8_t)(s->rel.resend_req_from >> 16);
+        payload[6] = (uint8_t)(s->rel.resend_req_from >> 8);
+        payload[7] = (uint8_t)s->rel.resend_req_from;
+        control_key(s, ck);
+        randombytes_buf(nonce, sizeof nonce);
+        n = tt_frame_encode(out, cap, TT_FRAME_RESEND, 0, 0, ck, nonce,
+                            NULL, 0, payload, sizeof payload);
+        sodium_memzero(ck, sizeof ck);
+        sodium_memzero(nonce, sizeof nonce);
+        sodium_memzero(payload, sizeof payload);
+        return n > 0 ? n : 0;
+    }
+
+    /* 2. RESEND reply: re-encrypt one buffered message (gen==req_gen &&
+       seq>=req_from) under the FRESH chain, one per poll call. The re-sent
+       message is tagged with the CURRENT gen/seq, so the peer's ACK evicts
+       it normally. We scan from the head each call because emit_frame
+       mutates the ring (appends the re-send, possibly evicting the head). */
+    if (s->rel.resend_rep_pending) {
+        TTSentBuf *b = &s->rel.sent;
+        for (uint16_t r = 0; r < b->count; r++) {
+            uint16_t idx = (b->head + r) % TT_SENT_MAX;
+            TTSentMsg *m = &b->m[idx];
+            if (m->gen != s->rel.resend_rep_gen ||
+                m->seq < s->rel.resend_rep_from)
+                continue;
+            uint32_t old_gen = m->gen, old_seq = m->seq;
+            n = emit_frame(s, m->data, m->len, out, cap);
+            if (n > 0) {
+                /* the re-send consumed a fresh seq; drop the old entry so
+                   it is not re-sent again */
+                rel_sent_remove(s, old_gen, old_seq);
+                return n;
+            }
+        }
+        s->rel.resend_rep_pending = false;
+        return 0;
+    }
+
+    /* 3. ACK: tell the peer the highest contiguous seq we delivered, so it
+       can evict its buffer. Sent once per delivered batch. */
+    if (s->rel.ack_due) {
+        s->rel.ack_due = false;
+        uint32_t a = s->rel.recv_acked, g = rel_gen(s);
+        payload[0] = (uint8_t)(a >> 24);
+        payload[1] = (uint8_t)(a >> 16);
+        payload[2] = (uint8_t)(a >> 8);
+        payload[3] = (uint8_t)a;
+        payload[4] = (uint8_t)(g >> 24);
+        payload[5] = (uint8_t)(g >> 16);
+        payload[6] = (uint8_t)(g >> 8);
+        payload[7] = (uint8_t)g;
+        control_key(s, ck);
+        randombytes_buf(nonce, sizeof nonce);
+        n = tt_frame_encode(out, cap, TT_FRAME_ACK, 0, 0, ck, nonce,
+                            NULL, 0, payload, sizeof payload);
+        sodium_memzero(ck, sizeof ck);
+        sodium_memzero(nonce, sizeof nonce);
+        sodium_memzero(payload, sizeof payload);
+        return n > 0 ? n : 0;
+    }
+
+    return 0;
 }
 
 /* ---- tick: INIT retransmit ---- */
