@@ -2346,6 +2346,9 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
     case TT_CMD_AV_SELFVIEW:
         tt_av_cmd_selfview(t, ev->friend_number, ev->ival);
         break;
+    case TT_CMD_AV_CAMERA:
+        tt_av_cmd_camera(t, ev->friend_number, ev->ival);
+        break;
     case TT_CMD_AV_VTEST:
         tt_av_cmd_vtest(t, ev->friend_number, ev->ival);
         break;

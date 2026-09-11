@@ -155,17 +155,22 @@ ringing; the callee gets ✅ Answer / ✖ Decline / 📹 Video (Video answers wi
 2500 kbit/s VPX video). In-call: 📵 Hang up, ⏸ Pause / ▶ Resume (toxav call
 control — Resume only after OUR pause; while the PEER's pause is up the
 button renders disabled "⏸ Peer paused"), 🎤 Mute / 🎤 Unmute (our MIC),
-🔊 Mute out / 🔇 Unmute out (our SPEAKER), duration timer ("M:SS on call" /
-"M:SS paused"), and — when the call carries video — 🔄 Show self / 🔄 Show
-peer (video pane swap). The roster callmark follows the sub-state:
+🔊 Mute out / 🔇 Unmute out (our SPEAKER), 📷 Camera / 📷 Stop cam (start or
+stop OUR camera mid-call — video is no longer peer-initiated-only), duration
+timer ("M:SS on call" / "M:SS paused"), and — when the call carries video
+(peer-offered or our own camera) — 🔄 Show self / 🔄 Show peer (video pane
+swap). The roster callmark follows the sub-state:
 🔔 ringing, ⏸ paused, 📞 active. The contact avatar (when set) sits at the
 far right of the header, outside the call buttons. Incoming/outgoing video is a
 Tk photo pane (YUV420 -> BT.601 RGB in C, ~30 fps repaint ceiling, auto-hide
 after 3 s of no frames). The camera layer opens /dev/video0 (V4L2 MMAP,
 YUYV -> planar YUV420, sizes 1280x720 -> 640x480 -> 320x240) when the call
-sends video; without a camera (or ALSA device) the call continues
-audio-only / mute-recv with a log note. Bit-rate adaptation: toxav packet-loss
-suggestions (> 10%) are applied via toxav_*_set_bit_rate, adjust-down only.
+sends video — either because the peer offered it or because you pressed
+📷 Camera (the engine toggles video sending mid-call via
+toxav_video_set_bit_rate); without a camera (or ALSA device) the call
+continues audio-only / mute-recv with a log note. Bit-rate adaptation: toxav
+packet-loss suggestions (> 10%) are applied via toxav_*_set_bit_rate,
+adjust-down only.
 
 Group A/V is NOT supported (upstream toxcore groupav covers legacy
 conferences only; NGC has no A/V). Audio never crosses the UI event queue

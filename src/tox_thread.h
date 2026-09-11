@@ -151,6 +151,7 @@ typedef enum {
     TT_CMD_AV_MUTE,          /* friend_number, ival: 0 unmute mic / 1 mute mic (engine-side gate) */
     TT_CMD_AV_DEAF,          /* M-AV5: friend_number, ival: 0 unmute output / 1 mute output */
     TT_CMD_AV_SELFVIEW,      /* M-AV5: friend_number, ival: 1 stream local camera to the UI pane */
+    TT_CMD_AV_CAMERA,        /* M-AV6: friend_number, ival: 1 start our camera / 0 stop (mid-call) */
     TT_CMD_AV_VTEST,         /* M-AV4 harness: ival 1 = pump test video frames, 0 = stop */
     TT_CMD_AV_SET_VIDEO_BR,  /* tier B2: friend_number, ival: video kbps 1..1000000 */
     TT_CMD_E2EE_REORDER,     /* M4 harness: friend_number; build DATA frames

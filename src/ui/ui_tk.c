@@ -91,6 +91,7 @@ typedef struct Contact {
     bool call_muted;         /* M-AV3: our mic gate while call_active */
     bool call_deaf;          /* M-AV5: our output gate while call_active */
     bool call_video;         /* M-AV5: call negotiated video (pane swap / Video answer) */
+    bool call_cam;           /* M-AV6: our camera is sending (self-initiated mid-call) */
     time_t call_started;     /* M-AV5: duration timer base (0 = not ticking) */
     bool call_paused_self;   /* WE paused (Resume valid; peer-paused renders
                                 disabled "Peer paused" — toxav resumes only
@@ -1076,6 +1077,7 @@ static void chead_call_render(Ui *ui, const Contact *c) {
     EV("pack", "forget", ".main.chat.chead.pause");
     EV("pack", "forget", ".main.chat.chead.mute");
     EV("pack", "forget", ".main.chat.chead.deaf");
+    EV("pack", "forget", ".main.chat.chead.cam");
     EV("pack", "forget", ".main.chat.chead.self");
     EV("pack", "forget", ".main.chat.chead.answ");
     EV("pack", "forget", ".main.chat.chead.decl");
@@ -1110,12 +1112,19 @@ static void chead_call_render(Ui *ui, const Contact *c) {
         EV(".main.chat.chead.mute", "configure", "-text",
            c->call_muted ? "🎤 Unmute" : "🎤 Mute");
         EV("pack", ".main.chat.chead.mute", "-side", "right", "-padx", "2");
+        /* M-AV6: self-initiated camera toggle (mid-call, not paused) */
+        if (!paused) {
+            EV(".main.chat.chead.cam", "configure", "-text",
+               c->call_cam ? "📷 Stop cam" : "📷 Camera");
+            EV("pack", ".main.chat.chead.cam", "-side", "right", "-padx", "2");
+        }
         /* output gate: independent of the mic gate (M-AV5) */
         EV(".main.chat.chead.deaf", "configure", "-text",
            c->call_deaf ? "🔇 Unmute out" : "🔊 Mute out");
         EV("pack", ".main.chat.chead.deaf", "-side", "right", "-padx", "2");
-        /* M-AV5 pane swap: visible only while the call carries video */
-        if (c->call_video && !paused) {
+        /* M-AV5 pane swap: visible while the call carries video — either
+           the peer offered it or our own camera is sending (M-AV6) */
+        if ((c->call_video || c->call_cam) && !paused) {
             EV(".main.chat.chead.self", "configure", "-text",
                ui->video_self ? "🔄 Show peer" : "🔄 Show self");
             EV("pack", ".main.chat.chead.self", "-side", "right", "-padx", "2");
@@ -1136,6 +1145,7 @@ static void chead_call_render_off(Ui *ui) {
     EV("pack", "forget", ".main.chat.chead.pause");
     EV("pack", "forget", ".main.chat.chead.mute");
     EV("pack", "forget", ".main.chat.chead.deaf");
+    EV("pack", "forget", ".main.chat.chead.cam");
     EV("pack", "forget", ".main.chat.chead.self");
     EV("pack", "forget", ".main.chat.chead.answ");
     EV("pack", "forget", ".main.chat.chead.decl");
@@ -1633,6 +1643,9 @@ static void handle_event(Ui *ui, TTEvent *e) {
         Contact *c = contact_by_fn(ui, e->friend_number);
         if (!c) break;
         c->call_state = e->ival;
+        /* M-AV6: our camera is sending iff the SENDING_V bit is set (the
+           engine echoes it back on a self-initiated toggle) */
+        c->call_cam = (e->ival & TOXAV_FRIEND_CALL_STATE_SENDING_V) != 0;
         if (e->ival & (TOXAV_FRIEND_CALL_STATE_SENDING_A | TOXAV_FRIEND_CALL_STATE_ACCEPTING_A)) {
             c->call_incoming = false; /* answered on the other side of a handshake */
             c->call_active = true;
@@ -1674,6 +1687,7 @@ static void handle_event(Ui *ui, TTEvent *e) {
         c->call_muted = false;
         c->call_deaf = false;
         c->call_video = false;
+        c->call_cam = false;
         c->call_started = 0;
         c->call_paused_self = false;
         c->call_ringing = false;
@@ -2765,14 +2779,28 @@ static int cc_av_deaf(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const ob
     return TCL_OK;
 }
 
-/* M-AV5 pane swap: mirror our own camera into the video pane (and back) */
+/* M-AV5 pane swap: mirror our own camera into the video pane (and back).
+   Works when the call carries video — peer-offered or our own camera. */
 static int cc_av_self(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
     (void)cd; (void)ip; (void)objv; (void)objc;
     Contact *c = g_ui.sel_kind == TT_SEL_CHAT ? contact_by_fn(&g_ui, g_ui.sel_fn) : NULL;
-    if (!c || !c->call_active || !c->call_video) return TCL_OK;
+    if (!c || !c->call_active || !(c->call_video || c->call_cam)) return TCL_OK;
     g_ui.video_self = !g_ui.video_self;
     cc_call(&g_ui, TT_CMD_AV_SELFVIEW, g_ui.video_self ? 1 : 0, 0);
     chead_call_render(&g_ui, c);
+    return TCL_OK;
+}
+
+/* M-AV6: self-initiated camera toggle (mid-call). The engine turns video
+   sending on/off via toxav_video_set_bit_rate and echoes the SENDING_V
+   state back; we flip the label here and let the AV_STATE echo re-render. */
+static int cc_av_cam(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    (void)cd; (void)ip; (void)objv; (void)objc;
+    Contact *c = g_ui.sel_kind == TT_SEL_CHAT ? contact_by_fn(&g_ui, g_ui.sel_fn) : NULL;
+    if (!c || !c->call_active) return TCL_OK;
+    c->call_cam = !c->call_cam;
+    cc_call(&g_ui, TT_CMD_AV_CAMERA, c->call_cam ? 1 : 0, 0);
+    chead_call_render(&g_ui, c); /* label flips 📷 Camera <-> 📷 Stop cam */
     return TCL_OK;
 }
 
@@ -4954,6 +4982,8 @@ static void build_widgets(Ui *ui) {
        "-command", "tt_av_mute", "-width", "7");
     EV("ttk::button", ".main.chat.chead.pause", "-text", "⏸ Pause",
        "-command", "tt_av_pause", "-width", "8");
+    EV("ttk::button", ".main.chat.chead.cam", "-text", "📷 Camera",
+       "-command", "tt_av_cam", "-width", "7");
     EV("ttk::button", ".main.chat.chead.self", "-text", "📹 Video",
        "-command", "tt_av_self", "-width", "7");
     /* M-AV5: toggle our output gate for the selected contact's call */
@@ -5139,6 +5169,7 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_av_video", cc_av_answer_video);
     bind_cmd(&g_ui, "tt_av_deaf", cc_av_deaf);
     bind_cmd(&g_ui, "tt_av_self", cc_av_self);
+    bind_cmd(&g_ui, "tt_av_cam", cc_av_cam);
     bind_cmd(&g_ui, "tt_video_tick", cc_video_tick);
     bind_cmd(&g_ui, "tt_call_tick", cc_call_tick);
     bind_cmd(&g_ui, "tt_gnew_open", cc_gnew_open);

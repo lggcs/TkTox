@@ -567,6 +567,33 @@ void tt_av_cmd_vtest(TTToxThread *t, uint32_t fn, int on) {
     }
 }
 
+/* M-AV6: self-initiated camera. toxav_video_set_bit_rate is the mid-call
+   video toggle: when the call's video_bit_rate is 0 and we set a non-zero
+   rate, toxav calls msi_change_capabilities(... | MSI_CAP_S_VIDEO) to turn
+   video sending on; setting 0 turns it off. The video RTP/codec sessions
+   are created unconditionally in call_prepare_transmission, so they exist
+   even for an audio-only call. There is no self callback for a capabilities
+   change (only the peer gets one), so we synthesize the SENDING_V bit
+   locally to gate video_send_drain and drive the UI. */
+void tt_av_cmd_camera(TTToxThread *t, uint32_t fn, int on) {
+    if (!t->av) return;
+    TTAvg *g = avg_slot(t);
+    if (!g || g->call_fn != fn) return;
+    bool sending = (g->state & TOXAV_FRIEND_CALL_STATE_SENDING_V) != 0;
+    if (on == (sending ? 1 : 0)) return; /* already in the requested state */
+    Toxav_Err_Bit_Rate_Set serr;
+    bool ok = toxav_video_set_bit_rate(t->av, fn, on ? TT_AV_VIDEO_BITRATE : 0,
+                                       &serr);
+    TT_LOG("av", "camera(%u, %d): %d", fn, on, ok ? (int)serr : -1);
+    if (!ok) return;
+    uint32_t state = g->state;
+    if (on) state |= TOXAV_FRIEND_CALL_STATE_SENDING_V;
+    else    state &= ~TOXAV_FRIEND_CALL_STATE_SENDING_V;
+    push_av_local_state(t, fn, (int)state);
+    if (on) video_lifecycle(g, true);
+    else    video_lifecycle(g, false);
+}
+
 /* Tier B2: mid-call video bit-rate change. toxav_video_set_bit_rate accepts
    1..1000000 kbit/s (0 would toggle the video stream off — a capability
    change, not a rate; 0 is rejected above, as video_br_fixup does). */

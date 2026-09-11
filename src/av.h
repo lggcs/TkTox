@@ -66,6 +66,7 @@ void tt_av_cmd_resume(TTToxThread *t, uint32_t fn);
 void tt_av_cmd_mute(TTToxThread *t, uint32_t fn, bool muted);
 void tt_av_cmd_deaf(TTToxThread *t, uint32_t fn, bool deaf);
 void tt_av_cmd_selfview(TTToxThread *t, uint32_t fn, int on);
+void tt_av_cmd_camera(TTToxThread *t, uint32_t fn, int on); /* M-AV6: self-initiated camera */
 void tt_av_cmd_vtest(TTToxThread *t, uint32_t fn, int on);
 void tt_av_cmd_video_br(TTToxThread *t, uint32_t fn, int br);
 
