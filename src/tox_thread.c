@@ -4,6 +4,7 @@
 #include "av.h"
 #include "session.h"
 #include "session_store.h"
+#include "tunnel.h"
 #include <tox/toxencryptsave.h>
 #include <sodium.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 /* used by callbacks registered long before its definition below */
 static void push_simple(TTToxThread *t, TTEventType type, uint32_t fn, const char *s, size_t len, int ival);
 static void offline_flush_friend(TTToxThread *t, uint32_t fn);
+
 static void emit_friend_identity(TTToxThread *t, uint32_t fn);
 
 /* ---- E2EE layer (TT_E2EE=1; session.h) ---- */
@@ -1577,6 +1579,12 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
                                        void *user_data) {
     TTToxThread *t = user_data;
     (void)tox;
+    if (length < 1) return;
+    /* Tunnel TCP channel (type 162) and signaling (type 163) — both lossless. */
+    if (data[0] == TT_TUNNEL_TCP_PACKET_ID || data[0] == TT_TUNNEL_SIG_PACKET_ID) {
+        tt_tunnel_rx_tcp(t, friend_number, data, length);
+        return;
+    }
     if (length < TT_GAME_HEADER_SIZE) return;
     int type = data[0];
     if (type != TT_GAME_PACKET_INVITE && type != TT_GAME_PACKET_DATA) return;
@@ -1586,6 +1594,16 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
     (void)id;
     chess_rx(t, friend_number, type, data + TT_GAME_HEADER_SIZE,
              length - TT_GAME_HEADER_SIZE);
+}
+
+/* Lossy custom packet callback (toxcore). Only the tunnel uses lossy
+   packets; everything else is dispatched to the tunnel engine. */
+static void cb_friend_lossy_packet(Tox *tox, uint32_t friend_number,
+                                    const uint8_t *data, size_t length,
+                                    void *user_data) {
+    TTToxThread *t = user_data;
+    (void)tox;
+    tt_tunnel_rx(t, friend_number, data, length);
 }
 
 /* ---- chess command handlers (UI -> tox thread) ---- */
@@ -2745,6 +2763,55 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
     case TT_CMD_CHESS_RESIGN:
         handle_cmd_chess_resign(t, ev->friend_number);
         break;
+    case TT_CMD_TUNNEL_ALLOW:
+        if (ev->str) {
+            if (ev->ival == 0) tt_tunnel_allow_all(t, ev->str);
+            else tt_tunnel_allow(t, (unsigned)ev->ival, ev->str);
+        }
+        break;
+    case TT_CMD_TUNNEL_DENY:
+        if (ev->str) tt_tunnel_deny(t, (unsigned)ev->ival, ev->str);
+        break;
+    case TT_CMD_TUNNEL_SHARE: {
+        /* str: "<server_host>\n<udp_ports>\n<tcp_ports>" where each ports
+           field is a comma-separated list of single numbers or "start-end"
+           ranges. */
+        if (!ev->str) break;
+        char host[256], *p1, *p2;
+        snprintf(host, sizeof host, "%s", ev->str);
+        p1 = strchr(host, '\n');
+        if (!p1) break;
+        *p1 = '\0'; p1++;
+        p2 = strchr(p1, '\n');
+        if (!p2) break;
+        *p2 = '\0'; p2++;
+        TTPortRangeList udp = {0}, tcp = {0};
+        tt_port_list_parse(p1, &udp);
+        tt_port_list_parse(p2, &tcp);
+        tt_tunnel_share(t, ev->friend_number, host, &udp, &tcp);
+        break;
+    }
+    case TT_CMD_TUNNEL_ACCEPT: {
+        /* str: "<udp_ports>\n<tcp_ports>" where each ports field is a
+           comma-separated list of single numbers or "start-end" ranges. */
+        if (!ev->str) break;
+        char buf[256], *p;
+        snprintf(buf, sizeof buf, "%s", ev->str);
+        p = strchr(buf, '\n');
+        if (!p) break;
+        *p = '\0'; p++;
+        TTPortRangeList udp = {0}, tcp = {0};
+        tt_port_list_parse(buf, &udp);
+        tt_port_list_parse(p, &tcp);
+        tt_tunnel_accept(t, ev->friend_number, &udp, &tcp);
+        break;
+    }
+    case TT_CMD_TUNNEL_DECLINE:
+        tt_tunnel_decline(t, ev->friend_number);
+        break;
+    case TT_CMD_TUNNEL_STOP:
+        tt_tunnel_stop(t, (unsigned)ev->ival);
+        break;
     default:
         TT_LOG("tox", "unknown command %d", (int)ev->type);
         break;
@@ -3215,6 +3282,7 @@ static void *tox_thread_main(void *arg) {
     tox_callback_friend_name(tox, cb_friend_name);
     tox_callback_friend_message(tox, cb_friend_message);
     tox_callback_friend_lossless_packet(tox, cb_friend_lossless_packet);
+    tox_callback_friend_lossy_packet(tox, cb_friend_lossy_packet);
     tox_callback_friend_connection_status(tox, cb_friend_connection);
     tox_callback_friend_status_message(tox, cb_friend_status_message);
     tox_callback_friend_status(tox, cb_friend_status);
@@ -3334,6 +3402,7 @@ static void *tox_thread_main(void *arg) {
     while (!t->stop) {
         tox_iterate(tox, t);
         if (t->av) tt_av_iterate(t, t->av);
+        if (tt_tunnel_active(t)) tt_tunnel_poll(t);
 
         for (;;) {
             TTEvent *cmd = tt_queue_pop_timed(&t->in, 0);
@@ -3342,7 +3411,11 @@ static void *tox_thread_main(void *arg) {
             tt_event_free(cmd);
         }
 
+        /* The tunnel carries UDP datagrams, so when it is active we poll on
+           a short fixed interval instead of toxcore's (typically ~50ms)
+           iteration interval — otherwise game traffic latency balloons. */
         uint32_t iv = tox_iteration_interval(tox);
+        if (tt_tunnel_active(t) && iv > 5) iv = 5;
         struct timespec ts = { .tv_sec = (time_t)(iv / 1000), .tv_nsec = (long)(iv % 1000) * 1000000L };
         nanosleep(&ts, NULL);
 
@@ -3373,6 +3446,7 @@ static void *tox_thread_main(void *arg) {
     if (t->e2ee)
         tt_session_store_save(t->e2ee, t->profile_path, t->session_key);
     tt_av_kill(t); /* all active calls forcibly terminated (toxav.h); before tox_kill */
+    tt_tunnel_stop_all(t); /* close tunnel sockets before tox_kill */
     tox_kill(tox);
     t->tox = NULL;
     for (uint32_t i = 0; i < TT_MAX_FRIENDS; i++)

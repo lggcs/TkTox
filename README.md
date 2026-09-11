@@ -171,6 +171,56 @@ Group A/V is NOT supported (upstream toxcore groupav covers legacy
 conferences only; NGC has no A/V). Audio never crosses the UI event queue
 (device rings drain straight into toxav on the tox thread).
 
+Tunnels (UDP + TCP port forwarding over Tox)
+--------------------------------------------
+A tuntox-style port forwarder for LAN-party gaming: the host shares a local
+game server's ports with friends over the encrypted Tox channel, and each
+friend's game connects to a local loopback IP on their own machine — no port
+forwarding, no public IP, no central server. Two transports ride the same
+tunnel:
+
+- **UDP (lossy)** — Tox lossy custom packets (type 200). For real-time game
+  traffic (MineTest UDP 30000, AoE3 UDP 2300-2310). May drop/reorder.
+- **TCP (lossless)** — Tox lossless custom packets (type 162). For SSH, RDP,
+  Minecraft (TCP 25565), AoE3 TCP 80/2300-2310. Reliable and ordered.
+
+Each tunnel carries a **list of disjoint port ranges per protocol** (up to 8
+ranges / 32 ports per protocol), so one tunnel can carry all of a game's
+scattered ports — e.g. AoE3 Original (UDP 2300-2310 + TCP 80,2300-2310) or
+AoE3 DE (TCP 3478,5222,8888,27015,27036). Ports are entered as comma-separated
+numbers/ranges (e.g. `2300-2310,80`).
+
+**Loopback octets (client side).** Each client tunnel auto-assigns its own
+loopback IP (`127.0.0.2`, `.3`, …) instead of all binding `127.0.0.1`, so
+multiple simultaneous tunnels sharing the same ports don't collide — and
+games that only accept an IP (not individual ports) can point at the tunnel's
+IP on the well-known port. The whole `127.0.0.0/8` block is loopback on both
+Linux and Windows, so this works with zero config. The assignment is an
+atomic bind-and-claim (no probe race), so two friends joining the same host
+with the same ports get distinct octets.
+
+**Host side.** The host never binds a local port — it only makes outbound
+connections to the server, one per friend. So sharing the same port combo
+with multiple friends works: each friend gets an independent tunnel, the game
+server sees them as distinct clients, and the Tunnels panel lists one row per
+friend (endpoint + friend name + Stop). The host tunnel accepts an arbitrary
+`server_host`, so you can point different host tunnels at different loopback
+octets on the host to run two services on the same port number.
+
+**UI.** The tool-row **Tunnels** button opens a panel listing active tunnels
+endpoint-first ("Hosting 127.0.0.1 udp 2300-2310 tcp 80" / "Joined
+127.0.0.2 udp 2300-2310 tcp 80"), each with the friend underneath and a Stop
+button. The roster menu **Share a port…** opens the host dialog (server host +
+UDP ports + TCP ports); an incoming invite shows Accept/Decline with an
+optional local-port override (blank = auto-pick free ones). Host access is
+allowlist-controlled (the invited friend is auto-allowlisted; `--tunnel-trust-all`
+auto-allowlists any friend that connects, opt-in for testing).
+
+Headless entry points (see tunnel-test.sh / tunnel-multi-test.sh):
+    --tunnel-host <profile> <server_host> <udp_ports> [<tcp_ports>]
+        [--tunnel-trust-all] [<friend_toxid>...]
+    --tunnel-client <profile> <host_toxid> <udp_ports> [<tcp_ports>]
+
 Tor
 ---
 SOCKS5 proxy (Tor SocksPort) routes ALL tox traffic: UDP disabled, DHT
@@ -202,6 +252,8 @@ Tests
     bash e2ee-test.sh                            # E2EE handshake + roundtrip + verify codes
     bash e2ee-test.sh reorder                    # + out-of-order frames via skipped-key store
     bash e2ee-test.sh replay                     # + re-injected frame rejected as replay
+    bash tunnel-test.sh                          # UDP lossy + TCP lossless round-trips over Tox
+    bash tunnel-multi-test.sh                    # 2 clients, same ports, distinct loopback octets
 
 Engine commands beyond the UI buttons (session-only, scriptable):
 TT_CMD_AV_SET_VIDEO_BR (mid-call video kbit/s, 1..1000000) — Pause/Resume

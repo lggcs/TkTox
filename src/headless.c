@@ -2,6 +2,7 @@
 #include "headless.h"
 #include "log.h"
 #include "chess.h"
+#include "tunnel.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1907,4 +1908,128 @@ int invrest_test_main(const char *profile, const char *peer_toxid, bool phase_b)
            rc, peer_in, self_dropped);
     tt_tox_thread_stop(&tt);
     return rc;
+}
+
+/* ---- UDP-over-Tox tunnel (headless) ----
+   Host: --tunnel-host <profile> <server_host> <udp_ports> [<tcp_ports>] [--tunnel-trust-all] [<friend_toxid>...]
+     Relays UDP from the allowlisted friends to server_host:<udp_ports>, and
+     (if tcp_ports is given) forwards TCP to server_host:<tcp_ports>. Ports
+     are a comma-separated list of single numbers or "start-end" ranges
+     (e.g. "2300-2310,80").
+     Accepts friend requests (friends add the host by its ToxID). The
+     allowlist is populated from the trailing ToxID args and can be mutated
+     at runtime via TT_CMD_TUNNEL_ALLOW / TT_CMD_TUNNEL_DENY.
+   Client: --tunnel-client <profile> <host_toxid> <udp_ports> [<tcp_ports>]
+     Adds the host, binds 127.0.0.<auto>:<udp_ports> (UDP) and, if tcp_ports
+     is given, 127.0.0.<auto>:<tcp_ports> (TCP), forwarding to the host. Each
+     client tunnel gets its own loopback IP (127.0.0.2, .3, ...) so
+     simultaneous tunnels don't collide on the same ports. */
+int tunnel_host_main(const char *profile, const char *server_host,
+                     const TTPortRangeList *udp, const TTPortRangeList *tcp,
+                     char **allow_toxids, int n_allow, bool trust_all) {
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+    TTToxThread tt;
+    if (!tt_tox_thread_start(&tt, profile, false)) {
+        TT_LOG("main", "failed to start tox thread");
+        return 1;
+    }
+    unsigned tid = tt_tunnel_start_host(&tt, server_host, udp, tcp);
+    if (tid == 0) {
+        TT_LOG("tunnel", "host: failed to start tunnel");
+        tt_tox_thread_stop(&tt);
+        return 1;
+    }
+    for (int i = 0; i < n_allow; i++)
+        tt_queue_post2(&tt.in, TT_CMD_TUNNEL_ALLOW, 0, allow_toxids[i], (int)tid, 0);
+    TT_LOG("tunnel", "host: running (Ctrl-C to stop)");
+    while (!g_stop) {
+        TTEvent *ev = tt_queue_pop_timed(&tt.out, 500);
+        if (!ev) continue;
+        switch (ev->type) {
+        case TT_EV_TOXID:
+            TT_LOG("tunnel", "host ToxID: %s", ev->str ? ev->str : "?");
+            break;
+        case TT_EV_FRIEND_REQUEST:
+            if (ev->str && strlen(ev->str) == TOX_PUBLIC_KEY_SIZE * 2) {
+                TT_LOG("tunnel", "host: accepting request from %s", ev->str);
+                tt_queue_post(&tt.in, TT_CMD_ACCEPT_FRIEND, 0, ev->str, 0);
+            }
+            break;
+        case TT_EV_FRIEND_CONNECTION:
+            TT_LOG("tunnel", "host: friend %u connection: %d",
+                   ev->friend_number, ev->ival);
+            break;
+        case TT_EV_FRIEND_PUBKEY:
+            /* trust-all: auto-allowlist any friend that connects (their
+               identity is emitted on connection). Opt-in for testing so the
+               host and client can both start fresh without pre-seeding the
+               allowlist — the default remains explicit allowlist only. */
+            if (trust_all && ev->str &&
+                strlen(ev->str) == TOX_PUBLIC_KEY_SIZE * 2) {
+                TT_LOG("tunnel", "host: trust-all allow %s", ev->str);
+                tt_tunnel_allow_all(&tt, ev->str);
+            }
+            break;
+        case TT_EV_SHUTDOWN:
+            g_stop = 1;
+            break;
+        default:
+            break;
+        }
+        tt_event_free(ev);
+    }
+    tt_tox_thread_stop(&tt);
+    return 0;
+}
+
+int tunnel_client_main(const char *profile, const char *host_toxid,
+                       const TTPortRangeList *udp, const TTPortRangeList *tcp) {
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+    TTToxThread tt;
+    if (!tt_tox_thread_start(&tt, profile, false)) {
+        TT_LOG("main", "failed to start tox thread");
+        return 1;
+    }
+    /* The host's public key is the first 64 hex chars of its ToxID. */
+    char host_pk[TOX_PUBLIC_KEY_SIZE * 2 + 1];
+    if (!host_toxid || strlen(host_toxid) < TOX_PUBLIC_KEY_SIZE * 2) {
+        TT_LOG("tunnel", "client: bad host ToxID");
+        tt_tox_thread_stop(&tt);
+        return 1;
+    }
+    memcpy(host_pk, host_toxid, TOX_PUBLIC_KEY_SIZE * 2);
+    host_pk[TOX_PUBLIC_KEY_SIZE * 2] = '\0';
+    unsigned tid = tt_tunnel_start_client(&tt, udp, tcp, host_pk);
+    if (tid == 0) {
+        TT_LOG("tunnel", "client: failed to start tunnel");
+        tt_tox_thread_stop(&tt);
+        return 1;
+    }
+    tt_queue_post(&tt.in, TT_CMD_ADD_FRIEND, 0, host_toxid, 0);
+    char us[256];
+    tt_port_list_to_str(udp, us, sizeof us);
+    TT_LOG("tunnel", "client: running on 127.0.0.<auto>:%s (Ctrl-C to stop)", us);
+    while (!g_stop) {
+        TTEvent *ev = tt_queue_pop_timed(&tt.out, 500);
+        if (!ev) continue;
+        switch (ev->type) {
+        case TT_EV_TOXID:
+            TT_LOG("tunnel", "client ToxID: %s", ev->str ? ev->str : "?");
+            break;
+        case TT_EV_FRIEND_CONNECTION:
+            TT_LOG("tunnel", "client: host friend %u connection: %d",
+                   ev->friend_number, ev->ival);
+            break;
+        case TT_EV_SHUTDOWN:
+            g_stop = 1;
+            break;
+        default:
+            break;
+        }
+        tt_event_free(ev);
+    }
+    tt_tox_thread_stop(&tt);
+    return 0;
 }

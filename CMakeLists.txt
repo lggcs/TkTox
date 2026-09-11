@@ -107,6 +107,7 @@ set(TT_SOURCES
   src/session_store.c
   src/app_state.c
   src/log.c
+  src/tunnel.c
   src/ui/ui_tk.c
   src/crypto/kdf.c
   src/crypto/aead.c

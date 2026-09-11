@@ -10,6 +10,9 @@
 
 #include "offline_queue.h"
 
+/* Max simultaneous tunnels (mesh topology). Must match tunnel.h. */
+#define TT_TUNNEL_MAX_TUNNELS 16
+
 /* At-rest profile encryption (toxencryptsave, scrypt KDF — same module uTox
    and qTox use). Opaque; only tox_thread.c touches the internals. */
 struct Tox_Pass_Key;
@@ -86,6 +89,15 @@ typedef enum {
     TT_EV_CHESS_MOVE,        /* friend_number, str: 4-char algebraic move "e2e4" */
     TT_EV_CHESS_END,         /* friend_number, ival: 0 checkmate, 1 stalemate,
                                 2 resign; ival2: 1 if we won (0 draw/loss) */
+    /* UDP-over-Tox tunnel (src/tunnel.c). */
+    TT_EV_TUNNEL_INVITE,     /* client: friend_number invited us to a share;
+                                str: server_host; ival: server_port;
+                                ival2: tcp_server_port (0 = none) */
+    TT_EV_TUNNEL_ADD,        /* a tunnel became live. ival: tunnel id;
+                                ival2: 1 = host, 0 = client; str: endpoint */
+    TT_EV_TUNNEL_STATE,      /* host: friend_number accepted (ival2=1) or
+                                declined (ival2=2) our invite; ival: tunnel id */
+    TT_EV_TUNNEL_REMOVE,     /* a tunnel was stopped. ival: tunnel id */
     TT_EV_SHUTDOWN,
 } TTEventType;
 
@@ -159,6 +171,16 @@ typedef enum {
     TT_CMD_CHESS_DECLINE,    /* friend_number: decline a pending chess invite. */
     TT_CMD_CHESS_MOVE,       /* friend_number, str: 4-char algebraic move "e2e4" */
     TT_CMD_CHESS_RESIGN,     /* friend_number: resign the current game. */
+    /* UDP-over-Tox tunnel. Runtime allowlist mutation — no tunnel teardown
+       required. ival carries the tunnel id (0 = apply to every host tunnel,
+       used by trust-all test mode). */
+    TT_CMD_TUNNEL_ALLOW,     /* host: relay this friend's UDP to the server */
+    TT_CMD_TUNNEL_DENY,      /* host: stop relaying this friend */
+    /* Tunnel lifecycle (UI -> engine). */
+    TT_CMD_TUNNEL_SHARE,     /* host: friend_number; str: "<server_host>\n<port>\n<tcp_port>" */
+    TT_CMD_TUNNEL_ACCEPT,    /* client: friend_number; str: "<local_port>\n<tcp_local_port>" */
+    TT_CMD_TUNNEL_DECLINE,   /* client: friend_number: decline a pending invite */
+    TT_CMD_TUNNEL_STOP,      /* ival: tunnel id to stop */
 } TTCommandType;
 
 /* TT_CMD_GROUP_SYNC reply burst (reuses existing event types):
@@ -293,6 +315,12 @@ typedef struct TTToxThread {
     /* Chess interop state (wire-compatible with toxic's game_chess.c). One
        game per friend. The engine lives in src/chess.c. */
     struct TTChessGame *chess[TT_MAX_FRIENDS]; /* NULL = no active game */
+    /* UDP-over-Tox tunnels (src/tunnel.c). A process can run several at once
+       (mesh topology); each has a stable numeric id. The engine runs on the
+       tox thread; the allowlist is mutable at runtime via
+       TT_CMD_TUNNEL_ALLOW / TT_CMD_TUNNEL_DENY. */
+    struct TTTunnel *tunnels[TT_TUNNEL_MAX_TUNNELS];
+    unsigned tunnel_seq; /* monotonic tunnel id allocator */
     /* At-rest passphrase handshake (GUI mode only): the tox thread posts
        TT_EV_PASSPHRASE_NEEDED then blocks on pass_cond until the UI thread
        delivers the passphrase (pass_buf) or cancels (pass_cancel). The

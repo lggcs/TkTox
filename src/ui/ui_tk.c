@@ -16,6 +16,7 @@
 #include "../history.h"
 #include "../log.h"
 #include "../chess.h"
+#include "../tunnel.h"
 #include <tcl.h>
 #include <tk.h>
 #include <tox/toxav.h>
@@ -25,6 +26,10 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 #define TT_TRANSCRIPT_MAX (64 * 1024)
 #define TT_LAST_MAX 48
@@ -131,6 +136,19 @@ typedef struct Group {
 
 #define TT_MAX_PEERS_ROSTER 512 /* role-map cap for the members dialog */
 
+/* A tunnel as mirrored in the UI. The engine owns the authoritative list in
+   the tox thread; the UI builds this from the TT_EV_TUNNEL_* event stream so
+   the panel can render endpoint-first with the friends underneath. */
+typedef struct TTTunnelUI {
+    unsigned id;          /* engine tunnel id */
+    bool host;            /* true = host, false = client */
+    bool pending;         /* invite sent/received, not yet live */
+    uint32_t peer_fn;     /* the friend this tunnel is with (UINT32_MAX = none) */
+    char endpoint[300];   /* host: "server_host udp <ports> tcp <ports>";
+                             client: "127.0.0.<octet> udp <ports> tcp <ports>" */
+    struct TTTunnelUI *next;
+} TTTunnelUI;
+
 typedef struct Ui {
     Tcl_Interp *interp;
     TTToxThread *tt;
@@ -191,6 +209,17 @@ typedef struct Ui {
     int chess_sel_rank, chess_sel_file; /* selected square (-1 = none) */
     bool chess_dragging;   /* a drag is in progress (press -> release) */
     bool chess_invite_open;  /* invite accept/decline dialog shown */
+    /* UDP-over-Tox tunnel UI. The engine lives in the tox thread; the UI
+       mirrors the active tunnels for the panel and posts commands back. */
+    bool tun_panel_open;   /* tunnel panel toplevel shown */
+    bool tun_share_open;   /* host "Share port..." dialog shown */
+    bool tun_invite_open;  /* client invite accept/decline dialog shown */
+    uint32_t tun_invite_fn;/* friend number of the pending invite (UINT32_MAX = none) */
+    TTPortRangeList tun_invite_udp; /* server UDP ports offered */
+    TTPortRangeList tun_invite_tcp; /* server TCP ports offered */
+    char tun_invite_host[256];  /* server host offered */
+    /* active tunnels mirrored from the event stream (for the panel) */
+    struct TTTunnelUI *tunnels;
 } Ui;
 
 static Ui g_ui;
@@ -203,6 +232,10 @@ static void chead_avatar_render(Ui *ui, const Contact *c);
 /* chess interop: used by handle_event before their definitions */
 static void chess_open(Ui *ui, uint32_t fn, TTColor self, bool started);
 static void chess_draw_board(Ui *ui);
+/* tunnel panel: used by handle_event before their definitions */
+static void tun_panel_render(Ui *ui);
+static TTTunnelUI *tun_ui_find(Ui *ui, unsigned id);
+static void tun_ui_remove(Ui *ui, unsigned id);
 
 /* ---- Tcl plumbing ---- */
 
@@ -2341,6 +2374,96 @@ static void handle_event(Ui *ui, TTEvent *e) {
         ui->chess_dragging = false;
         break;
     }
+    case TT_EV_TUNNEL_INVITE: {
+        /* someone invited us to a share. Show accept/decline. */
+        if (ui->tun_invite_open) break;
+        ui->tun_invite_open = true;
+        ui->tun_invite_fn = e->friend_number;
+        /* str = "<host>\n<udp_ports>\n<tcp_ports>" */
+        char host[256], *p1, *p2;
+        snprintf(host, sizeof host, "%s", e->str ? e->str : "?");
+        p1 = strchr(host, '\n');
+        if (p1) { *p1 = '\0'; p1++; }
+        p2 = p1 ? strchr(p1, '\n') : NULL;
+        if (p2) *p2 = '\0';
+        snprintf(ui->tun_invite_host, sizeof ui->tun_invite_host, "%s", host);
+        ui->tun_invite_udp = (TTPortRangeList){0};
+        ui->tun_invite_tcp = (TTPortRangeList){0};
+        if (p1) tt_port_list_parse(p1, &ui->tun_invite_udp);
+        if (p2) tt_port_list_parse(p2 + 1, &ui->tun_invite_tcp);
+        char us[256];
+        tt_port_list_to_str(&ui->tun_invite_udp, us, sizeof us);
+        EV("destroy", ".tuninv");
+        EV("toplevel", ".tuninv", "-padx", "14", "-pady", "14");
+        EV("wm", "title", ".tuninv", "Tunnel invite");
+        dlg_theme(ui, ".tuninv");
+        char msg[400];
+        snprintf(msg, sizeof msg,
+                 "invites you to share %s:%s over a tunnel. Accept to expose "
+                 "it on a local loopback IP (127.0.0.x) you can enter in the "
+                 "game.",
+                 ui->tun_invite_host, us);
+        EV("ttk::label", ".tuninv.l", "-text", msg, "-wraplength", "320");
+        EV("ttk::label", ".tuninv.lp", "-text",
+           "Local ports (blank = auto-pick free ones)");
+        EV("ttk::entry", ".tuninv.port", "-width", "10");
+        EV("ttk::frame", ".tuninv.b");
+        EV("ttk::button", ".tuninv.yes", "-text", "Accept", "-command", "tt_tun_accept",
+           "-style", "Green.TButton");
+        EV("ttk::button", ".tuninv.no", "-text", "Decline", "-command", "tt_tun_decline");
+        EV("pack", ".tuninv.l", "-side", "top", "-anchor", "w", "-pady", "4");
+        EV("pack", ".tuninv.lp", "-side", "top", "-anchor", "w", "-pady", "2");
+        EV("pack", ".tuninv.port", "-side", "top", "-fill", "x", "-pady", "2");
+        EV("pack", ".tuninv.yes", "-side", "right", "-pady", "8", "-padx", "4");
+        EV("pack", ".tuninv.no", "-side", "right", "-pady", "8");
+        EV("pack", ".tuninv.b", "-side", "top", "-anchor", "e");
+        EV("bind", ".tuninv.port", "<Return>", "tt_tun_accept");
+        EV("wm", "protocol", ".tuninv", "WM_DELETE_WINDOW", "tt_tun_decline");
+        EV("focus", ".tuninv.port");
+        break;
+    }
+    case TT_EV_TUNNEL_ADD: {
+        /* a tunnel became live. Mirror it into ui->tunnels. */
+        TTTunnelUI *tn = tun_ui_find(ui, (unsigned)e->ival);
+        if (!tn) {
+            tn = calloc(1, sizeof *tn);
+            if (tn) {
+                tn->id = (unsigned)e->ival;
+                tn->host = e->ival2 != 0;
+                tn->peer_fn = e->friend_number;
+                snprintf(tn->endpoint, sizeof tn->endpoint, "%s",
+                         e->str ? e->str : "?");
+                tn->next = ui->tunnels;
+                ui->tunnels = tn;
+            }
+        } else {
+            tn->host = e->ival2 != 0;
+            tn->peer_fn = e->friend_number;
+            snprintf(tn->endpoint, sizeof tn->endpoint, "%s",
+                     e->str ? e->str : "?");
+        }
+        if (ui->tun_panel_open) tun_panel_render(ui);
+        break;
+    }
+    case TT_EV_TUNNEL_STATE: {
+        /* host: friend accepted (ival2=1) or declined (ival2=2) our invite. */
+        TTTunnelUI *tn = tun_ui_find(ui, (unsigned)e->ival);
+        if (tn) {
+            if (e->ival2 == 2) {
+                /* declined -> the tunnel is gone */
+                tun_ui_remove(ui, tn->id);
+            } else {
+                tn->pending = false;
+                tn->peer_fn = e->friend_number;
+            }
+        }
+        if (ui->tun_panel_open) tun_panel_render(ui);
+        break;
+    }
+    case TT_EV_TUNNEL_REMOVE:
+        tun_ui_remove(ui, (unsigned)e->ival);
+        if (ui->tun_panel_open) tun_panel_render(ui);
+        break;
     case TT_EV_SHUTDOWN:
         ui->quitting = true;
         EV("destroy", ".");
@@ -3706,6 +3829,251 @@ static int cc_chess_close(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *cons
     return TCL_OK;
 }
 
+/* ---- tunnel UI ---- */
+
+/* Open the tunnel panel (list of active tunnels). */
+static int cc_tun_panel(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->tun_panel_open) return TCL_OK;
+    ui->tun_panel_open = true;
+    EV("toplevel", ".tun", "-padx", "14", "-pady", "14");
+    EV("wm", "title", ".tun", "Tunnels");
+    dlg_theme(ui, ".tun");
+    EV("ttk::label", ".tun.head", "-text", "Active tunnels", "-font", "f_bold");
+    EV("ttk::frame", ".tun.list");
+    EV("ttk::button", ".tun.close", "-text", "Close", "-command", "tt_tun_panel_close");
+    EV("pack", ".tun.head", "-side", "top", "-anchor", "w", "-pady", "4");
+    EV("pack", ".tun.list", "-side", "top", "-fill", "both", "-expand", "true");
+    EV("pack", ".tun.close", "-side", "bottom", "-anchor", "e", "-pady", "8");
+    EV("wm", "protocol", ".tun", "WM_DELETE_WINDOW", "tt_tun_panel_close");
+    tun_panel_render(ui);
+    return TCL_OK;
+}
+
+static int cc_tun_panel_close(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    ui->tun_panel_open = false;
+    EV("destroy", ".tun");
+    return TCL_OK;
+}
+
+/* Host: open the "Share port..." dialog for the selected friend. */
+static int cc_tun_share_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->sel_kind != TT_SEL_CHAT) return TCL_OK;
+    Contact *c = contact_by_fn(ui, ui->sel_fn);
+    if (!c) return TCL_OK;
+    if (ui->tun_share_open) return TCL_OK;
+    ui->tun_share_open = true;
+    EV("destroy", ".tunshare");
+    EV("toplevel", ".tunshare", "-padx", "14", "-pady", "14");
+    EV("wm", "title", ".tunshare", "Share a port");
+    dlg_theme(ui, ".tunshare");
+    char msg[256];
+    snprintf(msg, sizeof msg, "Share a local port with %s.", c->name[0] ? c->name : "this friend");
+    EV("ttk::label", ".tunshare.l", "-text", msg, "-wraplength", "300");
+    EV("ttk::label", ".tunshare.lh", "-text", "Server host (e.g. 127.0.0.1)");
+    EV("ttk::entry", ".tunshare.host", "-width", "30");
+    EV(".tunshare.host", "insert", "0", "127.0.0.1");
+    EV("ttk::label", ".tunshare.lp", "-text",
+       "Server ports (UDP) — e.g. 2300-2310 or 2300-2310,80");
+    EV("ttk::entry", ".tunshare.port", "-width", "10");
+    EV("ttk::label", ".tunshare.lt", "-text",
+       "TCP ports (0 = none, for SSH/RDP) — e.g. 22 or 22-25,80");
+    EV("ttk::entry", ".tunshare.tcp", "-width", "10");
+    EV(".tunshare.tcp", "insert", "0", "0");
+    EV("ttk::frame", ".tunshare.b");
+    EV("ttk::button", ".tunshare.ok", "-text", "Share", "-command", "tt_tun_share_ok",
+       "-style", "Green.TButton");
+    EV("ttk::button", ".tunshare.no", "-text", "Cancel", "-command", "tt_tun_share_cancel");
+    EV("pack", ".tunshare.l", "-side", "top", "-anchor", "w", "-pady", "2");
+    EV("pack", ".tunshare.lh", "-side", "top", "-anchor", "w", "-pady", "2");
+    EV("pack", ".tunshare.host", "-side", "top", "-fill", "x", "-pady", "2");
+    EV("pack", ".tunshare.lp", "-side", "top", "-anchor", "w", "-pady", "2");
+    EV("pack", ".tunshare.port", "-side", "top", "-fill", "x", "-pady", "2");
+    EV("pack", ".tunshare.lt", "-side", "top", "-anchor", "w", "-pady", "2");
+    EV("pack", ".tunshare.tcp", "-side", "top", "-fill", "x", "-pady", "2");
+    EV("pack", ".tunshare.ok", "-side", "right", "-pady", "8", "-padx", "4");
+    EV("pack", ".tunshare.no", "-side", "right", "-pady", "8");
+    EV("pack", ".tunshare.b", "-side", "top", "-anchor", "e");
+    EV("bind", ".tunshare.port", "<Return>", "tt_tun_share_ok");
+    EV("wm", "protocol", ".tunshare", "WM_DELETE_WINDOW", "tt_tun_share_cancel");
+    EV("focus", ".tunshare.port");
+    return TCL_OK;
+}
+
+static int cc_tun_share_ok(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->sel_kind != TT_SEL_CHAT) return TCL_OK;
+    uint32_t fn = ui->sel_fn;
+    EV(".tunshare.host", "get");
+    const char *host = Tcl_GetStringResult(ui->interp);
+    EV(".tunshare.port", "get");
+    const char *port = Tcl_GetStringResult(ui->interp);
+    EV(".tunshare.tcp", "get");
+    const char *tcp = Tcl_GetStringResult(ui->interp);
+    if (!host || !*host || !port || !*port) return TCL_OK;
+    char payload[300];
+    snprintf(payload, sizeof payload, "%s\n%s\n%s", host, port, tcp);
+    tt_queue_post(&ui->tt->in, TT_CMD_TUNNEL_SHARE, fn, payload, 0);
+    EV("destroy", ".tunshare");
+    ui->tun_share_open = false;
+    return TCL_OK;
+}
+
+static int cc_tun_share_cancel(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    ui->tun_share_open = false;
+    EV("destroy", ".tunshare");
+    return TCL_OK;
+}
+
+/* Client: accept a pending tunnel invite. Auto-pick a free local port
+   (same as the offered server port if free, else the next free one), unless
+   the user typed an explicit override in the dialog. */
+static int cc_tun_accept(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->tun_invite_fn == UINT32_MAX) return TCL_OK;
+    uint32_t fn = ui->tun_invite_fn;
+    TTPortRangeList local = {0};
+    /* explicit override, if the user typed one */
+    EV(".tuninv.port", "get");
+    const char *ov = Tcl_GetStringResult(ui->interp);
+    if (ov && *ov) {
+        tt_port_list_parse(ov, &local);
+    } else {
+        /* auto-pick: for each offered range, keep the same shape but shift
+           the start to a free port if the offered one is taken. */
+        for (unsigned i = 0; i < ui->tun_invite_udp.count; i++) {
+            uint16_t start = ui->tun_invite_udp.r[i].start;
+            uint16_t cnt = ui->tun_invite_udp.r[i].count;
+            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            if (s >= 0) {
+                struct sockaddr_in a = {0};
+                a.sin_family = AF_INET;
+                a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                a.sin_port = htons(start);
+                if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) {
+                    for (int k = 1; k < 20 && start + k < 65535; k++) {
+                        a.sin_port = htons((uint16_t)(start + k));
+                        if (bind(s, (struct sockaddr *)&a, sizeof a) == 0) {
+                            start = (uint16_t)(start + k);
+                            break;
+                        }
+                    }
+                }
+                close(s);
+            }
+            local.r[local.count].start = start;
+            local.r[local.count].count = cnt;
+            local.count++;
+        }
+    }
+    char payload[256];
+    char us[128], ts[128];
+    tt_port_list_to_str(&local, us, sizeof us);
+    tt_port_list_to_str(&ui->tun_invite_tcp, ts, sizeof ts);
+    snprintf(payload, sizeof payload, "%s\n%s", us, ts);
+    tt_queue_post(&ui->tt->in, TT_CMD_TUNNEL_ACCEPT, fn, payload, 0);
+    EV("destroy", ".tuninv");
+    ui->tun_invite_open = false;
+    ui->tun_invite_fn = UINT32_MAX;
+    return TCL_OK;
+}
+
+static int cc_tun_decline(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip; (void)objv; (void)objc;
+    if (ui->tun_invite_fn == UINT32_MAX) return TCL_OK;
+    uint32_t fn = ui->tun_invite_fn;
+    tt_queue_post(&ui->tt->in, TT_CMD_TUNNEL_DECLINE, fn, NULL, 0);
+    EV("destroy", ".tuninv");
+    ui->tun_invite_open = false;
+    ui->tun_invite_fn = UINT32_MAX;
+    return TCL_OK;
+}
+
+/* Stop a tunnel from the panel. objv[1] = tunnel id. */
+static int cc_tun_stop(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    Ui *ui = cd; (void)ip;
+    if (objc < 2) return TCL_OK;
+    int id = atoi(Tcl_GetString(objv[1]));
+    tt_queue_post(&ui->tt->in, TT_CMD_TUNNEL_STOP, 0, NULL, id);
+    return TCL_OK;
+}
+
+/* Find a mirrored tunnel by id. */
+static TTTunnelUI *tun_ui_find(Ui *ui, unsigned id) {
+    for (TTTunnelUI *tn = ui->tunnels; tn; tn = tn->next)
+        if (tn->id == id) return tn;
+    return NULL;
+}
+
+/* Remove a mirrored tunnel by id (frees it). */
+static void tun_ui_remove(Ui *ui, unsigned id) {
+    TTTunnelUI **pp = &ui->tunnels;
+    while (*pp) {
+        if ((*pp)->id == id) {
+            TTTunnelUI *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Render the tunnel panel list. The engine state lives in the tox thread;
+   the UI mirrors it from the events it has seen (ui->tunnels). Endpoint-first:
+   each tunnel is one row, with the friend(s) underneath. */
+static void tun_panel_render(Ui *ui) {
+    /* destroy any previously-rendered rows so a re-render (e.g. after Stop)
+       doesn't stack stale widgets on top of the new ones */
+    EV("eval", "foreach w [winfo children .tun.list] { destroy $w }");
+    if (!ui->tunnels) {
+        EV("ttk::label", ".tun.list.empty", "-text",
+           "No active tunnels. Use the roster menu to share a port.",
+           "-foreground", C_HINT);
+        EV("pack", ".tun.list.empty", "-side", "top", "-anchor", "w", "-pady", "4");
+        return;
+    }
+    int i = 0;
+    for (TTTunnelUI *tn = ui->tunnels; tn; tn = tn->next, i++) {
+        char wname[64];
+        snprintf(wname, sizeof wname, ".tun.list.t%d", i);
+        EV("ttk::frame", wname, "-padding", "4");
+        char title[400];
+        if (tn->host) {
+            snprintf(title, sizeof title, "Hosting %s", tn->endpoint);
+        } else {
+            snprintf(title, sizeof title, "Joined %s", tn->endpoint);
+        }
+        if (tn->pending) strncat(title, " (pending)", sizeof title - strlen(title) - 1);
+        char wtitle[80];
+        snprintf(wtitle, sizeof wtitle, "%s.title", wname);
+        EV("ttk::label", wtitle, "-text", title, "-font", "f_bold");
+        EV("pack", wtitle, "-side", "top", "-anchor", "w");
+        /* the friend(s) underneath */
+        if (tn->peer_fn != UINT32_MAX) {
+            const Contact *c = contact_by_fn(ui, tn->peer_fn);
+            const char *nm = (c && c->name[0]) ? c->name : "friend";
+            char wpeer[96];
+            snprintf(wpeer, sizeof wpeer, "%s.peer", wname);
+            char pline[400];
+            snprintf(pline, sizeof pline, "  with %s", nm);
+            EV("ttk::label", wpeer, "-text", pline, "-foreground", C_SUBTEXT);
+            EV("pack", wpeer, "-side", "top", "-anchor", "w");
+        }
+        /* stop button */
+        char wstop[96];
+        snprintf(wstop, sizeof wstop, "%s.stop", wname);
+        char cmd[64];
+        snprintf(cmd, sizeof cmd, "tt_tun_stop %u", tn->id);
+        EV("ttk::button", wstop, "-text", "Stop", "-command", cmd);
+        EV("pack", wstop, "-side", "right", "-anchor", "e");
+        EV("pack", wname, "-side", "top", "-fill", "x", "-pady", "2");
+    }
+}
+
 /* Up on empty input recalls the last message you sent to the selected friend */
 static int cc_recall(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
     Ui *ui = cd; (void)ip; (void)objv; (void)objc;
@@ -4482,6 +4850,7 @@ static void build_widgets(Ui *ui) {
     EV(".rostermenu", "add", "command", "-label", "Copy Tox ID", "-command", "tt_copy_friend_id");
     EV(".rostermenu", "add", "separator");
     EV(".rostermenu", "add", "command", "-label", "Play chess", "-command", "tt_chess_invite");
+    EV(".rostermenu", "add", "command", "-label", "Share port...", "-command", "tt_tun_share_open");
     EV(".rostermenu", "add", "separator");
     EV(".rostermenu", "add", "command", "-label", "Remove friend", "-command", "tt_remove");
     EV("bind", ".sb.rf.roster", "<Button-3>", "tt_roster_menu %x %y %X %Y");
@@ -4527,12 +4896,15 @@ static void build_widgets(Ui *ui) {
        "-style", "Tool.TButton");
     EV("ttk::button", ".sb.tools.groups", "-text", "Groups \xe2\x96\xbe", "-command",
        "tt_groups_menu", "-style", "Tool.TButton");
+    EV("ttk::button", ".sb.tools.tunnels", "-text", "Tunnels", "-command",
+       "tt_tun_panel", "-style", "Tool.TButton");
     EV("ttk::style", "configure", "Tool.TButton",
        "-background", C_BADGE, "-foreground", C_LIST_TEXT, "-borderwidth", "0");
     EV("ttk::style", "map", "Tool.TButton", "-background", "active #4E4E4E");
     EV("pack", ".sb.tools.add", "-side", "left", "-fill", "both", "-expand", "true",
        "-padx", "2", "-pady", "2");
     EV("pack", ".sb.tools.groups", "-side", "left", "-fill", "both", "-padx", "2", "-pady", "2");
+    EV("pack", ".sb.tools.tunnels", "-side", "left", "-fill", "both", "-padx", "2", "-pady", "2");
     EV("grid", ".sb.tools", "-row", "3", "-column", "0", "-sticky", "ew");
 
     EV("grid", "rowconfigure", ".sb", "2", "-weight", "1");
@@ -4798,6 +5170,14 @@ int ui_run(TTToxThread *tt) {
     bind_cmd(&g_ui, "tt_gcopy_id", cc_gcopy_id);
     bind_cmd(&g_ui, "tt_pass_ok", cc_pass_ok);
     bind_cmd(&g_ui, "tt_pass_cancel", cc_pass_cancel);
+    bind_cmd(&g_ui, "tt_tun_panel", cc_tun_panel);
+    bind_cmd(&g_ui, "tt_tun_panel_close", cc_tun_panel_close);
+    bind_cmd(&g_ui, "tt_tun_share_open", cc_tun_share_open);
+    bind_cmd(&g_ui, "tt_tun_share_ok", cc_tun_share_ok);
+    bind_cmd(&g_ui, "tt_tun_share_cancel", cc_tun_share_cancel);
+    bind_cmd(&g_ui, "tt_tun_accept", cc_tun_accept);
+    bind_cmd(&g_ui, "tt_tun_decline", cc_tun_decline);
+    bind_cmd(&g_ui, "tt_tun_stop", cc_tun_stop);
 
     TT_LOG("tk", "phase: init ok, building widgets");
     build_widgets(&g_ui);
