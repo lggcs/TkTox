@@ -4710,7 +4710,7 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
     EV("ttk::scrollbar", ".gm.body.sb", "-orient", "vertical",
        "-command", ".gm.body.cv yview");
     EV("canvas", ".gm.body.cv", "-yscrollcommand", ".gm.body.sb set",
-       "-width", "360", "-height", "400", "-highlightthickness", "0");
+       "-width", "460", "-height", "400", "-highlightthickness", "0");
     EV("ttk::frame", ".gm.body.cv.inner");
     EV(".gm.body.cv", "create", "window", "0", "0", "-anchor", "nw",
        "-window", ".gm.body.cv.inner", "-tags", "inner");
@@ -4720,7 +4720,7 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
     /* stretch the inner frame to the canvas width so the label's -fill x
        has room to expand and the right-packed role widgets stay visible */
     EV("bind", ".gm.body.cv", "<Configure>",
-       ".gm.body.cv.itemconfigure inner -width [winfo width .gm.body.cv]");
+       ".gm.body.cv itemconfigure inner -width [winfo width .gm.body.cv]");
     for (GroupMember *m = g->members; m; m = m->next) {
         char fr[24], rowname[48], lrow[64], krow[64];
         snprintf(fr, sizeof fr, "%u", m->pid);
