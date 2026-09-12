@@ -101,6 +101,8 @@ typedef enum {
                                 ival: tunnel id; ival2: 1 = E2EE active,
                                 0 = not (raw fallback / handshake pending) */
     TT_EV_TUNNEL_REMOVE,     /* a tunnel was stopped. ival: tunnel id */
+    TT_EV_TUNNEL_ERROR,      /* a tunnel failed. ival: tunnel id;
+                                str: human-readable reason */
     TT_EV_SHUTDOWN,
 } TTEventType;
 

@@ -2488,6 +2488,14 @@ static void handle_event(Ui *ui, TTEvent *e) {
         tun_ui_remove(ui, (unsigned)e->ival);
         if (ui->tun_panel_open) tun_panel_render(ui);
         break;
+    case TT_EV_TUNNEL_ERROR: {
+        /* a tunnel failed (client bind failure, host invite timeout). */
+        tun_ui_remove(ui, (unsigned)e->ival);
+        if (ui->tun_panel_open) tun_panel_render(ui);
+        EV("tk_messageBox", "-icon", "warning", "-type", "ok", "-title",
+           "Tunnel failed", "-message", e->str ? e->str : "Tunnel failed.");
+        break;
+    }
     case TT_EV_SHUTDOWN:
         ui->quitting = true;
         EV("destroy", ".");

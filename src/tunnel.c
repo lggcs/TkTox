@@ -17,6 +17,10 @@
 
 #define TT_TUNNEL_ALLOW_MAX 64
 
+/* A host invite that the friend never accepts is dropped after this many
+   seconds, so the panel doesn't show a zombie "(pending)" row forever. */
+#define TT_TUNNEL_PENDING_TIMEOUT 60
+
 /* One allowlist entry: a friend identity (public key) the host will relay.
    fn is resolved lazily (UINT32_MAX = not yet a friend / unresolved) so the
    allowlist can be populated before the friend is added. */
@@ -59,6 +63,8 @@ struct TTTunnel {
     bool host;            /* true = host, false = client */
     bool pending;         /* host: invite sent, awaiting accept;
                              client: invite received, awaiting accept/decline */
+    time_t pending_since; /* when `pending` was set (host invite), for the
+                             never-accepted timeout; 0 = not pending */
     bool e2ee_active;     /* tunnel E2EE session with peer_fn is live (TT_E2EE
                              on and handshake completed); drives the UI badge */
     uint32_t peer_fn;     /* the friend this tunnel is with (host: invited
@@ -936,7 +942,22 @@ static void tunnel_poll_client(TTToxThread *t, struct TTTunnel *tn) {
 void tt_tunnel_poll(TTToxThread *t) {
     for (int i = 0; i < TT_TUNNEL_MAX_TUNNELS; i++) {
         struct TTTunnel *tn = t->tunnels[i];
-        if (!tn || !tn->used || tn->pending) continue;
+        if (!tn || !tn->used) continue;
+        /* A pending host invite that the friend never accepted times out. */
+        if (tn->pending && tn->host && tn->pending_since &&
+            time(NULL) - tn->pending_since >= TT_TUNNEL_PENDING_TIMEOUT) {
+            TT_LOG("tunnel", "host: friend %u never accepted tunnel %u — dropping",
+                   tn->peer_fn, tn->id);
+            TTEvent *ev = tt_event_new(TT_EV_TUNNEL_ERROR);
+            if (ev) {
+                ev->ival = (int)tn->id;
+                ev->str = strdup("The friend never accepted the tunnel invite.");
+                tt_queue_push(&t->out, ev);
+            }
+            tunnel_free(t, tn);
+            continue;
+        }
+        if (tn->pending) continue;
         tunnel_resolve(t, tn);
         /* Tunnel E2EE channel (TT_E2EE on): once the peer is resolved, kick
            the tunnel handshake if it hasn't started yet. Tunnels are
@@ -1070,6 +1091,7 @@ unsigned tt_tunnel_share(TTToxThread *t, uint32_t fn, const char *server_host,
     struct TTTunnel *tn = tunnel_alloc(t, true);
     if (!tn) return 0;
     tn->pending = true;
+    tn->pending_since = time(NULL);
     tn->peer_fn = fn;
     snprintf(tn->server_host, sizeof tn->server_host, "%s", server_host);
     tn->udp = udp ? *udp : (TTPortRangeList){0};
@@ -1120,6 +1142,13 @@ unsigned tt_tunnel_accept(TTToxThread *t, uint32_t fn, const TTPortRangeList *ud
     /* atomically claim a free loopback IP and bind all local sockets */
     if (!bind_client_local(t, tn)) {
         TT_LOG("tunnel", "client: no free loopback IP for ports");
+        TTEvent *ev = tt_event_new(TT_EV_TUNNEL_ERROR);
+        if (ev) {
+            ev->ival = (int)tn->id;
+            ev->str = strdup("Could not bind local ports for the tunnel "
+                             "(no free loopback IP / ports).");
+            tt_queue_push(&t->out, ev);
+        }
         tunnel_free(t, tn);
         return 0;
     }

@@ -9,10 +9,36 @@
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <tox/toxav.h>
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
+
+/* Find a free local port of the given type, starting the probe at `start`.
+   The offered server ports are often privileged (<1024) or in use on the
+   client, so if `start` can't be bound we jump to a free non-privileged
+   port (>=1024) instead of just shifting within the privileged range.
+   Returns the free port, or 0 if none found. */
+static uint16_t echo_free_port(int type, uint16_t start) {
+    uint16_t base = start;
+    if (base < 1024) base = 1024; /* non-root can't bind privileged ports */
+    for (int k = 0; k < 200; k++) {
+        uint16_t p = (uint16_t)(base + k);
+        if (p == 0) break;
+        int s = socket(AF_INET, type, 0);
+        if (s < 0) continue;
+        struct sockaddr_in a = {0};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons(p);
+        int ok = bind(s, (struct sockaddr *)&a, sizeof a) == 0;
+        close(s);
+        if (ok) return p;
+    }
+    return 0;
+}
 
 /* Headless mode: no GTK. Runs the tox thread, prints lifecycle events.
    Used for CI, M3 loopback tests, and display-less environments.
@@ -1415,6 +1441,48 @@ int echo_main(const char *profile) {
         case TT_EV_AV_ENDED:
             TT_LOG("echo", "call with %u ended (rc=%d dur=%ds)",
                    ev->friend_number, ev->ival, ev->ival2);
+            break;
+        /* tunnel: auto-accept shares so manual UI testing exercises the
+           tunnel E2EE channel end-to-end. str = "<host>\n<udp>\n<tcp>".
+           Accept with the offered ports remapped to free local ones (the
+           offered server ports are often privileged/in-use on the client). */
+        case TT_EV_TUNNEL_INVITE:
+            if (ev->str) {
+                char buf[256], *p1, *p2;
+                snprintf(buf, sizeof buf, "%s", ev->str);
+                p1 = strchr(buf, '\n');
+                if (p1) { *p1 = '\0'; p1++; }
+                p2 = p1 ? strchr(p1, '\n') : NULL;
+                if (p2) *p2 = '\0';
+                TTPortRangeList udp = {0}, tcp = {0};
+                if (p1) tt_port_list_parse(p1, &udp);
+                if (p2) tt_port_list_parse(p2 + 1, &tcp);
+                TT_LOG("echo", "tunnel invite from %u (host %s udp %s tcp %s) — accepting",
+                       ev->friend_number, buf, p1 ? p1 : "?", p2 ? p2 + 1 : "?");
+                /* remap each offered range to free local ports */
+                TTPortRangeList lu = {0}, lt = {0};
+                for (unsigned i = 0; i < udp.count; i++) {
+                    uint16_t start = echo_free_port(SOCK_DGRAM, udp.r[i].start);
+                    if (!start) break;
+                    lu.r[lu.count].start = start;
+                    lu.r[lu.count].count = udp.r[i].count;
+                    lu.count++;
+                }
+                for (unsigned i = 0; i < tcp.count; i++) {
+                    uint16_t start = echo_free_port(SOCK_STREAM, tcp.r[i].start);
+                    if (!start) break;
+                    lt.r[lt.count].start = start;
+                    lt.r[lt.count].count = tcp.r[i].count;
+                    lt.count++;
+                }
+                char payload[256];
+                char us[128], ts[128];
+                tt_port_list_to_str(&lu, us, sizeof us);
+                tt_port_list_to_str(&lt, ts, sizeof ts);
+                snprintf(payload, sizeof payload, "%s\n%s", us, ts);
+                tt_queue_post(&tt.in, TT_CMD_TUNNEL_ACCEPT, ev->friend_number,
+                              payload, 0);
+            }
             break;
         case TT_EV_GROUP_INVITE:
             TT_LOG("echo", "group invite \"%s\" (idx %d) from friend %u — accepting",
