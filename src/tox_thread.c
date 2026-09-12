@@ -3026,6 +3026,14 @@ static void *tox_thread_main(void *arg) {
     struct Tox_Options *opts = tox_options_new(NULL);
     if (!opts) return NULL;
 
+    /* Own the proxy host + savedata strings: toxcore otherwise stores the
+       pointers we pass in. The proxy host lives in a stack buffer scoped to
+       the proxy block below, and the savedata-load block that runs between
+       it and tox_new reuses that stack region — clobbering the host string
+       and making tox_new fail with PROXY_BAD_HOST on any profile reload
+       with a proxy set. Must be set before any allocating setter. */
+    tox_options_set_experimental_owned_data(opts, true);
+
     /* Group persistence: toxcore serializes DHT group chats into the
        savedata STATE_TYPE_GROUPS section (name, privacy, password, topic,
        roles, mod list, self role) and reconnects automatically on load
