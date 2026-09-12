@@ -4717,6 +4717,10 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
     EV("pack", ".gm.body.sb", "-side", "right", "-fill", "y");
     EV("pack", ".gm.body.cv", "-side", "left", "-fill", "both", "-expand", "true");
     EV("pack", ".gm.body", "-side", "top", "-fill", "both", "-expand", "true");
+    /* stretch the inner frame to the canvas width so the label's -fill x
+       has room to expand and the right-packed role widgets stay visible */
+    EV("bind", ".gm.body.cv", "<Configure>",
+       ".gm.body.cv.itemconfigure inner -width [winfo width .gm.body.cv]");
     for (GroupMember *m = g->members; m; m = m->next) {
         char fr[24], rowname[48], lrow[64], krow[64];
         snprintf(fr, sizeof fr, "%u", m->pid);
