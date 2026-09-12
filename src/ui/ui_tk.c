@@ -2104,9 +2104,14 @@ static void handle_event(Ui *ui, TTEvent *e) {
         EV("toplevel", ".gi", "-padx", "14", "-pady", "14");
         EV("wm", "title", ".gi", "Group Invitation");
         dlg_theme(ui, ".gi");
-        EV("ttk::label", ".gi.l1", "-text",
-           e->str && e->str[0] ? e->str : "A friend");
-        EV("ttk::label", ".gi.l2", "-text", "invites you to a group chat",
+        /* who is inviting (resolved from the friend number) + which group */
+        const Contact *inv = contact_by_fn(ui, e->friend_number);
+        const char *inv_name = (inv && inv->name[0]) ? inv->name : "A friend";
+        const char *gname = (e->str && e->str[0]) ? e->str : "an unnamed group";
+        char gi_msg[TT_NAME_MAX + 96];
+        snprintf(gi_msg, sizeof gi_msg, "%s invites you to join \xe2\x80\x9c%s\xe2\x80\x9d",
+                 inv_name, gname);
+        EV("ttk::label", ".gi.l1", "-text", gi_msg, "-font", "f_bold",
            "-wraplength", "320", "-justify", "left");
         EV("ttk::frame", ".gi.b");
         char acc[32], dec[32];
@@ -2116,8 +2121,7 @@ static void handle_event(Ui *ui, TTEvent *e) {
            "-style", "Green.TButton");
         EV("ttk::button", ".gi.no", "-text", "Decline", "-command", dec,
            "-style", "Danger.TButton");
-        EV("pack", ".gi.l1", "-side", "top", "-anchor", "w", "-font", "f_bold");
-        EV("pack", ".gi.l2", "-side", "top", "-anchor", "w", "-pady", "6");
+        EV("pack", ".gi.l1", "-side", "top", "-anchor", "w", "-pady", "6");
         EV("pack", ".gi.yes", "-side", "right", "-pady", "8", "-padx", "4");
         EV("pack", ".gi.no", "-side", "right", "-pady", "8");
         EV("pack", ".gi.b", "-side", "top", "-fill", "x");
@@ -3090,14 +3094,14 @@ static void offer_show(Ui *ui, Contact *c) {
     EV("wm", "title", ".fo", "Incoming File");
     dlg_theme(ui, ".fo");
     EV("ttk::label", ".fo.l1", "-text",
-       c->name[0] ? c->name : "A friend");
+       c->name[0] ? c->name : "A friend", "-font", "f_bold");
     EV("ttk::label", ".fo.l2", "-text", text, "-wraplength", "360", "-justify", "left");
     EV("ttk::frame", ".fo.b");
     EV("ttk::button", ".fo.yes", "-text", "Save as...", "-command", "tt_file_yes",
        "-style", "Green.TButton");
     EV("ttk::button", ".fo.no", "-text", "Decline", "-command", "tt_file_no",
        "-style", "Danger.TButton");
-    EV("pack", ".fo.l1", "-side", "top", "-anchor", "w", "-font", "f_bold");
+    EV("pack", ".fo.l1", "-side", "top", "-anchor", "w");
     EV("pack", ".fo.l2", "-side", "top", "-anchor", "w", "-pady", "6");
     EV("pack", ".fo.yes", "-side", "right", "-pady", "8", "-padx", "4");
     EV("pack", ".fo.no", "-side", "right", "-pady", "8");
