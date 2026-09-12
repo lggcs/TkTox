@@ -4704,15 +4704,28 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
              g->name[0] ? g->name : "group", role_str(g->self_role));
     EV("ttk::label", ".gm.h", "-text", hdr, "-font", "f_bold");
     EV("pack", ".gm.h", "-side", "top", "-anchor", "w", "-pady", "4");
+    /* scrollable body: rows live in an inner frame inside a canvas so large
+       groups don't grow the dialog past the screen (canvas height is fixed) */
+    EV("ttk::frame", ".gm.body");
+    EV("ttk::scrollbar", ".gm.body.sb", "-orient", "vertical",
+       "-command", ".gm.body.cv yview");
+    EV("canvas", ".gm.body.cv", "-yscrollcommand", ".gm.body.sb set",
+       "-height", "400", "-highlightthickness", "0");
+    EV("ttk::frame", ".gm.body.cv.inner");
+    EV(".gm.body.cv", "create", "window", "0", "0", "-anchor", "nw",
+       "-window", ".gm.body.cv.inner", "-tags", "inner");
+    EV("pack", ".gm.body.sb", "-side", "right", "-fill", "y");
+    EV("pack", ".gm.body.cv", "-side", "left", "-fill", "both", "-expand", "true");
+    EV("pack", ".gm.body", "-side", "top", "-fill", "both", "-expand", "true");
     for (GroupMember *m = g->members; m; m = m->next) {
         char fr[24], rowname[48], lrow[64], krow[64];
         snprintf(fr, sizeof fr, "%u", m->pid);
-        snprintf(rowname, sizeof rowname, ".gm.r%s", fr);
+        snprintf(rowname, sizeof rowname, ".gm.body.cv.inner.r%s", fr);
         EV("ttk::frame", rowname);
         char who[TT_NAME_MAX + 48];
         snprintf(who, sizeof who, "%s  \xc2\xb7  %s",
                  m->name[0] ? m->name : "peer", role_str(m->role));
-        snprintf(lrow, sizeof lrow, ".gm.r%s.l", fr);
+        snprintf(lrow, sizeof lrow, ".gm.body.cv.inner.r%s.l", fr);
         EV("ttk::label", lrow, "-text", who);
         EV("pack", lrow, "-side", "left", "-fill", "x", "-expand", "true");
         /* Ignore/Unignore: local-only mute of a peer's messages (any role
@@ -4720,7 +4733,7 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
         if (m->pid != g->self_pid) {
             char igcmd[48];
             snprintf(igcmd, sizeof igcmd, "tt_gignore %s", fr);
-            snprintf(krow, sizeof krow, ".gm.r%s.i", fr);
+            snprintf(krow, sizeof krow, ".gm.body.cv.inner.r%s.i", fr);
             EV("ttk::button", krow, "-text", m->ignored ? "Unignore" : "Ignore",
                "-command", igcmd, "-width", "7");
             EV("pack", krow, "-side", "right", "-padx", "2");
@@ -4731,14 +4744,14 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
             if (g->self_role <= TOX_GROUP_ROLE_MODERATOR) {
                 char kickcmd[48];
                 snprintf(kickcmd, sizeof kickcmd, "tt_gkick %s", fr);
-                snprintf(krow, sizeof krow, ".gm.r%s.k", fr);
+                snprintf(krow, sizeof krow, ".gm.body.cv.inner.r%s.k", fr);
                 EV("ttk::button", krow, "-text", "Kick", "-command", kickcmd,
                    "-style", "Danger.TButton", "-width", "6");
                 EV("pack", krow, "-side", "right", "-padx", "2");
             }
             /* role dropdown: observer/user/moderator (founder is fixed) */
-            char rolerow[32], rolecmd[72];
-            snprintf(rolerow, sizeof rolerow, ".gm.r%s.r", fr);
+            char rolerow[64], rolecmd[128];
+            snprintf(rolerow, sizeof rolerow, ".gm.body.cv.inner.r%s.r", fr);
             snprintf(rolecmd, sizeof rolecmd, "tt_grole %s %s", fr, rolerow);
             EV("ttk::combobox", rolerow, "-width", "10", "-state", "readonly",
                "-values", "observer user moderator");
@@ -4748,6 +4761,12 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
         }
         EV("pack", rowname, "-side", "top", "-fill", "x", "-pady", "2");
     }
+    /* keep the canvas scrollregion in sync with the content height; the
+       inner frame's height is only final once the window maps, so bind its
+       <Configure> (bind scripts are evaluated by Tcl, so [winfo ...] runs
+       at event time) rather than sampling it once at build time */
+    EV("bind", ".gm.body.cv.inner", "<Configure>",
+       ".gm.body.cv configure -scrollregion [list 0 0 0 [winfo reqheight .gm.body.cv.inner]]");
     EV("ttk::button", ".gm.close", "-text", "Close", "-command", "destroy .gm");
     EV("pack", ".gm.close", "-side", "bottom", "-pady", "8");
     return TCL_OK;
