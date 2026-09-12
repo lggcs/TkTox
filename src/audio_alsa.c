@@ -84,7 +84,12 @@ static void *capture_worker(void *arg) {
         if (n < 0) break;
         /* mic mute gate: muted bytes never reach the network path */
         if (g->mic_muted) continue;
-        ring_push(&g->audio->cap_ring, pcm, (size_t)n);
+        /* snd_pcm_readi returns SAMPLES (0..960); ring_push counts 20 ms
+           periods (1 period = TT_AUDIO_FRAME_FRAMES samples). pcm holds
+           exactly one period, so only a full read is a complete frame;
+           drop partial reads rather than overflow the source buffer. */
+        if (n == TT_AUDIO_FRAME_FRAMES)
+            ring_push(&g->audio->cap_ring, pcm, 1);
     }
     return NULL;
 }
