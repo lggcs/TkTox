@@ -4733,12 +4733,9 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
         char who[TT_NAME_MAX + 48];
         snprintf(who, sizeof who, "%s  \xc2\xb7  %s",
                  m->name[0] ? m->name : "peer", role_str(m->role));
-        snprintf(lrow, sizeof lrow, ".gm.body.cv.inner.r%s.l", fr);
-        /* cap the label width so a long name truncates (ellipsis) instead of
-           growing the row past the canvas and pushing the right-packed
-           buttons off; -fill x -expand true still stretches it to fill */
-        EV("ttk::label", lrow, "-text", who, "-width", "40");
-        EV("pack", lrow, "-side", "left", "-fill", "x", "-expand", "true");
+        /* pack the right-side buttons FIRST so they always get their space;
+           the label (packed last, -fill x -expand true) fills the rest and
+           truncates long names instead of pushing the buttons off */
         /* Ignore/Unignore: local-only mute of a peer's messages (any role
            can ignore; you cannot ignore yourself). */
         if (m->pid != g->self_pid) {
@@ -4774,6 +4771,10 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
                 EV("pack", rolerow, "-side", "right", "-padx", "2");
             }
         }
+        /* label last: fills remaining width, truncates long names */
+        snprintf(lrow, sizeof lrow, ".gm.body.cv.inner.r%s.l", fr);
+        EV("ttk::label", lrow, "-text", who, "-width", "30");
+        EV("pack", lrow, "-side", "left", "-fill", "x", "-expand", "true");
         EV("pack", rowname, "-side", "top", "-fill", "x", "-pady", "2");
     }
     /* keep the canvas scrollregion in sync with the content height; the
