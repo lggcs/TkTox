@@ -4753,15 +4753,19 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
                    "-style", "Danger.TButton", "-width", "6");
                 EV("pack", krow, "-side", "right", "-padx", "2");
             }
-            /* role dropdown: observer/user/moderator (founder is fixed) */
-            char rolerow[64], rolecmd[128];
-            snprintf(rolerow, sizeof rolerow, ".gm.body.cv.inner.r%s.r", fr);
-            snprintf(rolecmd, sizeof rolecmd, "tt_grole %s %s", fr, rolerow);
-            EV("ttk::combobox", rolerow, "-width", "10", "-state", "readonly",
-               "-values", "observer user moderator");
-            EV(rolerow, "set", role_str(m->role));
-            EV("bind", rolerow, "<<ComboboxSelected>>", rolecmd);
-            EV("pack", rolerow, "-side", "right", "-padx", "2");
+            /* role dropdown: observer/user/moderator (founder is fixed).
+               Only founders/moderators may change roles — a plain user
+               must not see the control at all. */
+            if (g->self_role <= TOX_GROUP_ROLE_MODERATOR) {
+                char rolerow[64], rolecmd[128];
+                snprintf(rolerow, sizeof rolerow, ".gm.body.cv.inner.r%s.r", fr);
+                snprintf(rolecmd, sizeof rolecmd, "tt_grole %s %s", fr, rolerow);
+                EV("ttk::combobox", rolerow, "-width", "10", "-state", "readonly",
+                   "-values", "observer user moderator");
+                EV(rolerow, "set", role_str(m->role));
+                EV("bind", rolerow, "<<ComboboxSelected>>", rolecmd);
+                EV("pack", rolerow, "-side", "right", "-padx", "2");
+            }
         }
         EV("pack", rowname, "-side", "top", "-fill", "x", "-pady", "2");
     }
