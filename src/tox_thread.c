@@ -212,14 +212,17 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
             e2ee_start(t, fn);
             return true;
         }
-        if (n == TT_E2EE_DECODE_FAIL) {
-            /* A decode failure on an ACTIVE session is a chain desync (the
-               two sides restored diverged chain roots), not a legacy peer —
-               a legacy client could never have established a session with
-               us. Re-establish: the peer (also active) sees our fresh INIT
-               and yields to re-run as responder, so the handshake completes
-               with fresh chains. Without this the two sides wedge forever
-               and every text is silently dropped. */
+        if (n == TT_E2EE_DECODE_FAIL || n == TT_E2EE_REPLAY) {
+            /* A decode failure or a replay on an ACTIVE session is a chain
+               desync (the two sides restored diverged chain roots / seq
+               numbers), not a legacy peer — a legacy client could never have
+               established a session with us. A replay (peer's send chain
+               behind our recv chain) can only be returned while active, so
+               it is always a desync here, never a genuine replay attack.
+               Re-establish: the peer (also active) sees our fresh INIT and
+               yields to re-run as responder, so the handshake completes with
+               fresh chains. Without this the two sides wedge forever and
+               every text is silently dropped. */
             if (s->active) {
                 TT_LOG("e2ee", "session desync(%u): re-establishing", fn);
                 e2ee_start(t, fn);
