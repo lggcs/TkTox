@@ -55,12 +55,16 @@ static void e2ee_env(TTToxThread *t, uint32_t fn, TTE2EEEnv *env) {
 
 /* send one frame (no offline queueing — a queued INIT would be stale on
    arrival and refused; DATA is requeued by the normal text path instead).
-   Returns the tox message id (receipt key) or 0 on failure. */
-static uint32_t e2ee_send_frame(TTToxThread *t, uint32_t fn, const uint8_t *buf,
+   `type` is the toxcore message type the frame rides as: handshake/control
+   frames are always NORMAL, but a chat DATA frame carries the ACTION flag so
+   the peer's cb_friend_message sees the right type (a "/me" line must come
+   back as an action, not a plain message). Returns the tox message id
+   (receipt key) or 0 on failure. */
+static uint32_t e2ee_send_frame(TTToxThread *t, uint32_t fn,
+                                Tox_Message_Type type, const uint8_t *buf,
                                 size_t len) {
     Tox_Err_Friend_Send_Message serr;
-    uint32_t mid = tox_friend_send_message(t->tox, fn, TOX_MESSAGE_TYPE_NORMAL,
-                                           buf, len, &serr);
+    uint32_t mid = tox_friend_send_message(t->tox, fn, type, buf, len, &serr);
     TT_LOG("e2ee", "frame tx(%u, %zu B): %d", fn, len, (int)serr);
     return serr == TOX_ERR_FRIEND_SEND_MESSAGE_OK ? mid : 0;
 }
@@ -92,7 +96,7 @@ static void e2ee_pump(TTToxThread *t, uint32_t fn) {
     for (;;) {
         int n = tt_session_flush(&t->e2ee[fn], &env, out, sizeof out);
         if (n <= 0) break;
-        uint32_t mid = e2ee_send_frame(t, fn, out, (size_t)n);
+        uint32_t mid = e2ee_send_frame(t, fn, TOX_MESSAGE_TYPE_NORMAL, out, (size_t)n);
         if (mid) push_simple(t, TT_EV_MESSAGE_SENT, fn, NULL, 0, (int)mid);
     }
 }
@@ -108,7 +112,7 @@ static void e2ee_rel_poll(TTToxThread *t, uint32_t fn) {
     for (;;) {
         int n = tt_session_rel_poll(&t->e2ee[fn], &env, out, sizeof out);
         if (n <= 0) break;
-        e2ee_send_frame(t, fn, out, (size_t)n);
+        e2ee_send_frame(t, fn, TOX_MESSAGE_TYPE_NORMAL, out, (size_t)n);
     }
 }
 
@@ -122,7 +126,7 @@ static void e2ee_tick(TTToxThread *t) {
         if (!env.peer_pk) continue;
         uint8_t out[TT_FRAME_MAX];
         int n = tt_session_tick(&t->e2ee[fn], &env, now, out, sizeof out);
-        if (n > 0) e2ee_send_frame(t, fn, out, (size_t)n);
+        if (n > 0) e2ee_send_frame(t, fn, TOX_MESSAGE_TYPE_NORMAL, out, (size_t)n);
         /* flush any queued ACK / RESEND control frame (e.g. a RESEND
            request queued by a desync whose reply needs a nudge) */
         e2ee_rel_poll(t, fn);
@@ -137,7 +141,7 @@ static void e2ee_start(TTToxThread *t, uint32_t fn) {
     uint8_t out[TT_FRAME_MAX];
     int n = tt_session_start(&t->e2ee[fn], &env, out, sizeof out);
     if (n > 0) {
-        e2ee_send_frame(t, fn, out, (size_t)n);
+        e2ee_send_frame(t, fn, TOX_MESSAGE_TYPE_NORMAL, out, (size_t)n);
         t->e2ee_handshake_at[fn] = time(NULL);
         TT_LOG("e2ee", "session init(%u)", fn);
     } else {
@@ -175,7 +179,7 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
         if (n == 0 && s->reply_due) { /* responder: send REPLY now */
             uint8_t out[TT_FRAME_MAX];
             int rn = tt_session_reply(s, &env, out, sizeof out);
-            if (rn > 0) e2ee_send_frame(t, fn, out, (size_t)rn);
+            if (rn > 0) e2ee_send_frame(t, fn, TOX_MESSAGE_TYPE_NORMAL, out, (size_t)rn);
         }
         if (s->active) {
             /* a live session means the friend speaks E2EE — clear any
@@ -1911,7 +1915,7 @@ static void offline_flush_friend(TTToxThread *t, uint32_t fn) {
                             off = len;
                             break;
                         }
-                        if (e2ee_send_frame(t, fn, frame, (size_t)sn) == 0)
+                        if (e2ee_send_frame(t, fn, TOX_MESSAGE_TYPE_NORMAL, frame, (size_t)sn) == 0)
                             break; /* friend dropped mid-flush: requeue the rest */
                         off += chunk;
                     }
@@ -2389,6 +2393,7 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
                         }
                         if (n > 0) {
                             uint32_t mid = e2ee_send_frame(t, ev->friend_number,
+                                                           (Tox_Message_Type)ev->ival2,
                                                            out, (size_t)n);
                             if (mid) {
                                 /* receipt key for the encrypted text (same
@@ -2838,7 +2843,7 @@ static void handle_cmd(TTToxThread *t, TTEvent *ev) {
                 TT_LOG("e2ee", "reorder: frame_at(%u) failed: %d", order[i], n);
                 break;
             }
-            e2ee_send_frame(t, ev->friend_number, frame, (size_t)n);
+            e2ee_send_frame(t, ev->friend_number, TOX_MESSAGE_TYPE_NORMAL, frame, (size_t)n);
             TT_LOG("e2ee", "reorder: delivered seq %u", order[i]);
         }
         break;
