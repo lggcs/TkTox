@@ -1,5 +1,6 @@
 #include "tunnel.h"
 #include "tox_thread.h"
+#include "session.h"
 #include "log.h"
 
 #include <stdlib.h>
@@ -642,6 +643,37 @@ static void tunnel_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
                TT_TUNNEL_MAX_DATAGRAM);
         return;
     }
+    /* Tunnel E2EE channel (TT_E2EE on): encrypt the WHOLE tunnel packet
+       (200 header + payload) as a DATA frame and ride it over a lossy
+       type-201 packet, so the receiver's tt_tunnel_rx parses the 200 header
+       from the decrypted plaintext (symmetric with the raw path). A
+       not-yet-active session drops the datagram (lossy semantics). Drain
+       any pending re-key carrier first so the datagram fits a plain DATA
+       frame. */
+    if (t->tun_e2ee) {
+        if (len > TT_TUNNEL_E2EE_MAX_DATAGRAM) {
+            TT_LOG("tunnel", "drop: e2ee datagram %zu > %d bytes", len,
+                   TT_TUNNEL_E2EE_MAX_DATAGRAM);
+            return;
+        }
+        TTSession *s = &t->tun_e2ee[fn];
+        if (!s->active) return; /* lossy: drop until handshake completes */
+        uint8_t pkt[TT_TUNNEL_HEADER + TT_TUNNEL_E2EE_MAX_DATAGRAM];
+        pkt[0] = TT_TUNNEL_PACKET_ID;
+        pkt[1] = TT_TUNNEL_VERSION;
+        pkt[2] = (uint8_t)port_idx;
+        memcpy(pkt + TT_TUNNEL_HEADER, data, len);
+        uint8_t frame[TT_FRAME_MAX];
+        /* drain a pending re-key carrier (empty DATA) so the datagram fits */
+        if (tt_session_rekey_pending(s)) {
+            int rn = tt_session_send_lossy(s, NULL, NULL, 0, frame, sizeof frame);
+            if (rn > 0) tt_tunnel_e2ee_send(t, fn, 1, frame, (size_t)rn);
+        }
+        int n = tt_session_send_lossy(s, NULL, pkt, TT_TUNNEL_HEADER + len,
+                                      frame, sizeof frame);
+        if (n > 0) tt_tunnel_e2ee_send(t, fn, 1, frame, (size_t)n);
+        return;
+    }
     uint8_t pkt[TT_TUNNEL_HEADER + TT_TUNNEL_MAX_DATAGRAM];
     pkt[0] = TT_TUNNEL_PACKET_ID;
     pkt[1] = TT_TUNNEL_VERSION;
@@ -708,6 +740,37 @@ static void tcp_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
     if (plen > TT_TUNNEL_TCP_MAX_PAYLOAD) {
         TT_LOG("tunnel", "tcp: payload %zu > %d bytes", plen,
                TT_TUNNEL_TCP_MAX_PAYLOAD);
+        return;
+    }
+    /* Tunnel E2EE channel (TT_E2EE on): encrypt the whole TCP frame (header
+       + payload) as a DATA frame and ride it over a lossless type-165 packet.
+       A not-yet-active session drops the frame (lossy semantics — no stash). */
+    if (t->tun_e2ee) {
+        if (plen > TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD) {
+            TT_LOG("tunnel", "tcp: e2ee payload %zu > %d bytes", plen,
+                   TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD);
+            return;
+        }
+        TTSession *s = &t->tun_e2ee[fn];
+        if (!s->active) return; /* drop until handshake completes */
+        uint8_t frame[TT_FRAME_MAX];
+        /* drain a pending re-key carrier (empty DATA) so the frame fits */
+        if (tt_session_rekey_pending(s)) {
+            int rn = tt_session_send_lossy(s, NULL, NULL, 0, frame, sizeof frame);
+            if (rn > 0) tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)rn);
+        }
+        /* the TCP frame (header + payload) is the plaintext */
+        uint8_t tcp[TT_TUNNEL_TCP_HEADER + TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD];
+        tcp[0] = TT_TUNNEL_TCP_PACKET_ID;
+        tcp[1] = TT_TUNNEL_TCP_VERSION;
+        tcp[2] = (uint8_t)port_idx;
+        tcp[3] = (uint8_t)(connid >> 8);
+        tcp[4] = (uint8_t)(connid & 0xff);
+        tcp[5] = opcode;
+        if (plen) memcpy(tcp + TT_TUNNEL_TCP_HEADER, payload, plen);
+        int n = tt_session_send_lossy(s, NULL, tcp, TT_TUNNEL_TCP_HEADER + plen,
+                                      frame, sizeof frame);
+        if (n > 0) tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)n);
         return;
     }
     uint8_t pkt[TT_TUNNEL_TCP_HEADER + TT_TUNNEL_TCP_MAX_PAYLOAD];
@@ -873,6 +936,14 @@ void tt_tunnel_poll(TTToxThread *t) {
         struct TTTunnel *tn = t->tunnels[i];
         if (!tn || !tn->used || tn->pending) continue;
         tunnel_resolve(t, tn);
+        /* Tunnel E2EE channel (TT_E2EE on): once the peer is resolved, kick
+           the tunnel handshake if it hasn't started yet. Tunnels are
+           ephemeral, so a fresh session per tunnel. */
+        if (t->tun_e2ee && tn->peer_fn != UINT32_MAX) {
+            TTSession *ts = &t->tun_e2ee[tn->peer_fn];
+            if (!ts->active && !ts->init_pending && !ts->reply_due)
+                tt_tunnel_e2ee_start(t, tn->peer_fn);
+        }
         if (tn->host) tunnel_poll_host(t, tn);
         else tunnel_poll_client(t, tn);
     }

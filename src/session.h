@@ -151,6 +151,8 @@ typedef struct TTRekey {
 
 typedef struct TTSession {
     bool active;         /* both directions established */
+    bool lossy;          /* tunnel channel: no reliable-transport buffering
+                            (datagrams are lossy; a dropped frame is fine) */
     bool i_am_initiator;
     bool init_pending;   /* INIT sent, REPLY awaited (initiator) */
     bool reply_due;      /* INIT accepted, REPLY to build (responder) */
@@ -223,6 +225,19 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env,
    negative TTE2EEStatus. len must not exceed TT_FRAME_DATA_MAX. */
 int tt_session_send(TTSession *s, const TTE2EEEnv *env, const uint8_t *text,
                     size_t len, uint8_t *out, size_t cap);
+
+/* Lossy (tunnel) channel send: encrypt one datagram as a DATA frame. A
+   not-yet-active session DROPS the datagram (lossy semantics — no stash,
+   no re-send). The caller must drain any pending re-key carrier first (see
+   tt_session_rekey_pending) so the datagram fits in a plain DATA frame. */
+int tt_session_send_lossy(TTSession *s, const TTE2EEEnv *env,
+                          const uint8_t *text, size_t len,
+                          uint8_t *out, size_t cap);
+
+/* True when the next emit_frame would carry a re-key header (REKEY or
+   KEMPUB), which leaves too little room for a full datagram. The tunnel
+   engine drains these as empty carrier frames before sending a datagram. */
+bool tt_session_rekey_pending(const TTSession *s);
 
 /* Pop ONE stashed text as a DATA frame into out (same return convention).
    Call repeatedly until it returns 0. */

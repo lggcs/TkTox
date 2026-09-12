@@ -282,6 +282,107 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
     return true;
 }
 
+/* ---- tunnel E2EE channel (TT_E2EE on) ----
+   A SEPARATE per-friend PQDR session for tunnel datagrams, so tunnel frames
+   never interleave with chat seq numbers. The handshake (INIT/REPLY) rides
+   lossless custom packets (type 164); UDP data rides lossy custom packets
+   (type 201); TCP data rides lossless custom packets (type 165). The E2EE
+   frame is the packet payload after the routing header. When E2EE is off,
+   the tunnel falls back to the raw 200/162 types (plaintext over toxcore's
+   transport crypto). */
+
+/* send one tunnel E2EE frame over a custom packet. kind selects the packet
+   type: 0 = handshake (lossless 164), 1 = UDP data (lossy 201),
+   2 = TCP data (lossless 165). */
+void tt_tunnel_e2ee_send(TTToxThread *t, uint32_t fn, int kind,
+                         const uint8_t *frame, size_t len) {
+    uint8_t pkt[TOX_MAX_CUSTOM_PACKET_SIZE];
+    uint8_t id;
+    if (kind == 0) id = TT_TUNNEL_E2EE_SIG_PACKET_ID;
+    else if (kind == 1) id = TT_TUNNEL_E2EE_UDP_PACKET_ID;
+    else id = TT_TUNNEL_E2EE_TCP_PACKET_ID;
+    pkt[0] = id;
+    pkt[1] = TT_TUNNEL_E2EE_VERSION;
+    if (len > sizeof pkt - 2) return;
+    memcpy(pkt + 2, frame, len);
+    Tox_Err_Friend_Custom_Packet err;
+    bool ok;
+    if (kind == 1)
+        ok = tox_friend_send_lossy_packet(t->tox, fn, pkt, len + 2, &err);
+    else
+        ok = tox_friend_send_lossless_packet(t->tox, fn, pkt, len + 2, &err);
+    if (!ok)
+        TT_LOG("tunnel-e2ee", "send(%u, kind %d, %zu B): err %d", fn, kind,
+               len, (int)err);
+}
+
+/* start (or restart) the tunnel E2EE session with fn as initiator */
+void tt_tunnel_e2ee_start(TTToxThread *t, uint32_t fn) {
+    if (!t->tun_e2ee) return;
+    TTE2EEEnv env;
+    e2ee_env(t, fn, &env);
+    if (!env.peer_pk) return;
+    uint8_t out[TT_FRAME_MAX];
+    int n = tt_session_start(&t->tun_e2ee[fn], &env, out, sizeof out);
+    if (n > 0) {
+        tt_tunnel_e2ee_send(t, fn, 0, out, (size_t)n);
+        TT_LOG("tunnel-e2ee", "session init(%u)", fn);
+    } else {
+        TT_LOG("tunnel-e2ee", "session init(%u) failed: %d", fn, n);
+    }
+}
+
+/* engine tick: INIT retransmits for every pending tunnel session */
+void tt_tunnel_e2ee_tick(TTToxThread *t) {
+    if (!t->tun_e2ee) return;
+    time_t now = time(NULL);
+    for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++) {
+        TTE2EEEnv env;
+        e2ee_env(t, fn, &env);
+        if (!env.peer_pk) continue;
+        uint8_t out[TT_FRAME_MAX];
+        int n = tt_session_tick(&t->tun_e2ee[fn], &env, now, out, sizeof out);
+        if (n > 0) tt_tunnel_e2ee_send(t, fn, 0, out, (size_t)n);
+    }
+}
+
+/* feed one received tunnel E2EE frame (from a 164/201/165 packet). Returns
+   the plaintext length (>0 = DATA to forward), 0 = handshake/control frame
+   consumed, or a negative TTE2EEStatus. */
+int tt_tunnel_e2ee_rx(TTToxThread *t, uint32_t fn, const uint8_t *frame,
+                      size_t len, uint8_t *pt, size_t pt_cap) {
+    if (!t->tun_e2ee || fn >= TT_MAX_FRIENDS) return TT_E2EE_NO_SESSION;
+    TTE2EEEnv env;
+    e2ee_env(t, fn, &env);
+    if (!env.peer_pk) return TT_E2EE_NOKEY;
+    TTSession *s = &t->tun_e2ee[fn];
+    bool handshaked = false;
+    int n = tt_session_feed(s, &env, frame, len, pt, pt_cap, &handshaked);
+    if (handshaked) {
+        if (n == 0 && s->reply_due) { /* responder: send REPLY now */
+            uint8_t out[TT_FRAME_MAX];
+            int rn = tt_session_reply(s, &env, out, sizeof out);
+            if (rn > 0) tt_tunnel_e2ee_send(t, fn, 0, out, (size_t)rn);
+        }
+        TT_LOG("tunnel-e2ee", "handshake(%u): active=%d", fn, s->active);
+        return 0;
+    }
+    if (n == 0) return 0; /* handshake/control frame consumed */
+    if (n < 0) {
+        /* a desync on the tunnel channel: re-establish (lossy — no reliable
+           transport to recover the lost datagram, so a fresh handshake is
+           the only recovery) */
+        if (n == TT_E2EE_DECODE_FAIL || n == TT_E2EE_REPLAY) {
+            if (s->active) {
+                TT_LOG("tunnel-e2ee", "desync(%u): re-establishing", fn);
+                tt_tunnel_e2ee_start(t, fn);
+            }
+        }
+        return n;
+    }
+    return n; /* DATA plaintext */
+}
+
 /* text > 1318B does not fit one frame: the engine emits ceil(len/chunk)
    frames, each rendered as its own message line (v1: no reassembly state) */
 #define TT_E2EE_CHUNK TT_FRAME_DATA_MAX
@@ -1583,6 +1684,18 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
     TTToxThread *t = user_data;
     (void)tox;
     if (length < 1) return;
+    /* Tunnel E2EE channel (TT_E2EE on): handshake (164) and TCP data (165)
+       ride lossless packets. Decrypt and forward any DATA plaintext to the
+       tunnel TCP engine. */
+    if (data[0] == TT_TUNNEL_E2EE_SIG_PACKET_ID ||
+        data[0] == TT_TUNNEL_E2EE_TCP_PACKET_ID) {
+        if (length < 2 || data[1] != TT_TUNNEL_E2EE_VERSION) return;
+        uint8_t pt[TT_FRAME_DATA_MAX]; /* full plaintext = 162 header + payload */
+        int n = tt_tunnel_e2ee_rx(t, friend_number, data + 2, length - 2,
+                                  pt, sizeof pt);
+        if (n > 0) tt_tunnel_rx_tcp(t, friend_number, pt, (size_t)n);
+        return;
+    }
     /* Tunnel TCP channel (type 162) and signaling (type 163) — both lossless. */
     if (data[0] == TT_TUNNEL_TCP_PACKET_ID || data[0] == TT_TUNNEL_SIG_PACKET_ID) {
         tt_tunnel_rx_tcp(t, friend_number, data, length);
@@ -1606,6 +1719,16 @@ static void cb_friend_lossy_packet(Tox *tox, uint32_t friend_number,
                                     void *user_data) {
     TTToxThread *t = user_data;
     (void)tox;
+    /* Tunnel E2EE channel (TT_E2EE on): UDP data (201) rides a lossy packet.
+       Decrypt and forward any DATA plaintext to the tunnel UDP engine. */
+    if (length >= 2 && data[0] == TT_TUNNEL_E2EE_UDP_PACKET_ID &&
+        data[1] == TT_TUNNEL_E2EE_VERSION) {
+        uint8_t pt[TT_FRAME_DATA_MAX]; /* full plaintext = 200 header + payload */
+        int n = tt_tunnel_e2ee_rx(t, friend_number, data + 2, length - 2,
+                                  pt, sizeof pt);
+        if (n > 0) tt_tunnel_rx(t, friend_number, pt, (size_t)n);
+        return;
+    }
     tt_tunnel_rx(t, friend_number, data, length);
 }
 
@@ -3381,6 +3504,17 @@ static void *tox_thread_main(void *arg) {
             TT_LOG("tox", "e2ee alloc failed — layer DISABLED");
             tt_e2ee_mode = false;
         } else {
+            /* Tunnel E2EE channel: a SEPARATE per-friend session for tunnel
+               datagrams (in-memory only — tunnels are ephemeral, so nothing
+               is persisted). Marked lossy so the reliable-transport buffering
+               is disabled (UDP datagrams are dropped, never re-sent). */
+            t->tun_e2ee = calloc(TT_MAX_FRIENDS, sizeof *t->tun_e2ee);
+            if (t->tun_e2ee) {
+                for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++)
+                    t->tun_e2ee[fn].lossy = true;
+            } else {
+                TT_LOG("tox", "tunnel e2ee alloc failed — tunnels fall back to raw");
+            }
             /* restore per-friend E2EE enforcement from the settings sidecar */
             tt_settings_load_e2ee(t->e2ee_required, t->profile_path);
             for (uint32_t fn = 0; fn < TT_MAX_FRIENDS; fn++)
@@ -3436,6 +3570,8 @@ static void *tox_thread_main(void *arg) {
         /* E2EE session pump (TT_E2EE): INIT retransmits + flush stashed
            texts once a handshake completes */
         if (tt_e2ee_mode) e2ee_tick(t);
+        /* Tunnel E2EE channel: INIT retransmits for pending tunnel sessions */
+        if (tt_e2ee_mode) tt_tunnel_e2ee_tick(t);
 
         /* DHT upkeep: re-bootstrap right away when self dropped offline
            (toxcore never re-adds DHT neighbors on its own once they decay),
@@ -3475,6 +3611,12 @@ static void *tox_thread_main(void *arg) {
             tt_session_clear(&t->e2ee[i]);
         free(t->e2ee);
         t->e2ee = NULL;
+    }
+    if (t->tun_e2ee) {
+        for (uint32_t i = 0; i < TT_MAX_FRIENDS; i++)
+            tt_session_clear(&t->tun_e2ee[i]);
+        free(t->tun_e2ee);
+        t->tun_e2ee = NULL;
     }
     if (t->pass_key) {
         tox_pass_key_free(t->pass_key);

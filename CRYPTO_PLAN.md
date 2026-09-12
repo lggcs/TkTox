@@ -132,6 +132,28 @@ in-memory session, so forward secrecy is best-effort, not absolute.
   e2ee_rx (shown once per session). README + root PLAN.md rewritten to the as-implemented
   C17/Tk design.
 
+## Tunnel E2EE channel (ROUND 40)
+
+The UDP/TCP-over-Tox tunnels (commit 3efe985) are now protected by the same PQDR ratchet,
+via a SEPARATE per-friend session (`t->tun_e2ee[fn]`) so tunnel frames never interleave
+with chat seq numbers. Tunnels are ephemeral, so the session is in-memory only (nothing
+persisted). The session is marked `lossy`, which disables the reliable-transport buffering
+(no stash, no ACK/RESEND, no re-send) — a dropped datagram is simply dropped, matching the
+gaming use case.
+
+- Handshake (INIT/REPLY) rides lossless custom packets (type 164).
+- UDP data rides lossy custom packets (type 201); the plaintext is the WHOLE 200 packet
+  (header + payload), so the receiver's `tt_tunnel_rx` parses the 200 header from the
+  decrypted bytes (symmetric with the raw path).
+- TCP data rides lossless custom packets (type 165); the plaintext is the WHOLE 162 frame.
+- When E2EE is off, the tunnel falls back to the raw 200/162 types (plaintext over
+  toxcore's transport crypto).
+- Re-key headers (REKEY/KEMPUB) leave too little room for a full datagram, so the engine
+  drains them as empty carrier frames first (`tt_session_rekey_pending`), then sends the
+  datagram as a plain DATA frame.
+- A desync on the tunnel channel re-establishes with a fresh handshake (lossy — there is
+  no reliable transport to recover the lost datagram).
+
 ## Honest limits (stated up front)
 
 - AES-GCM path needs ARMv8 crypto extensions; aarch64 dev box has them, but the cipher byte +

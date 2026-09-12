@@ -154,6 +154,7 @@ void tt_session_clear(TTSession *s) { sodium_memzero(s, sizeof *s); }
    sent buffer keeps its entries' original gens. */
 static void reestablish_preserve(TTSession *s) {
     TTReliable rel = s->rel;
+    bool lossy = s->lossy;
     uint8_t stash[sizeof s->pending];
     uint8_t np = s->n_pending;
     memcpy(stash, s->pending, sizeof stash);
@@ -161,6 +162,7 @@ static void reestablish_preserve(TTSession *s) {
     memcpy(s->pending, stash, sizeof stash);
     s->n_pending = np;
     s->rel = rel;
+    s->lossy = lossy;
 }
 
 /* buffer one outgoing message tagged {gen, seq}; FIFO-evicts the oldest
@@ -511,6 +513,9 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
     /* ---- reliable-transport control frames (ACK / RESEND) ---- */
     if (d.type == TT_FRAME_ACK || d.type == TT_FRAME_RESEND) {
         if (!s->active) return TT_E2EE_NO_SESSION;
+        /* a lossy (tunnel) session never sends these and never buffers, so
+           a stray control frame is a decode failure, not a recovery cue */
+        if (s->lossy) return TT_E2EE_DECODE_FAIL;
         if (d.hdr_len != 0) return TT_E2EE_DECODE_FAIL;
         uint8_t ck[TT_KEY32], scratch[16];
         control_key(s, ck);
@@ -570,7 +575,7 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
            must start at the receiver's next-expected seq (recv.seq), not
            the failed frame's seq — messages between them may have been
            dropped on the wire and are missing too. */
-        if (s->active) {
+        if (s->active && !s->lossy) {
             s->rel.resend_req_pending = true;
             s->rel.resend_req_gen = rel_gen(s);
             s->rel.resend_req_from = s->recv.seq;
@@ -596,8 +601,9 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
     }
 
     /* reliable transport: the highest contiguous seq delivered is now
-       recv.seq-1; mark an ACK due so the peer can evict its buffer */
-    if (s->recv.seq - 1 > s->rel.recv_acked) {
+       recv.seq-1; mark an ACK due so the peer can evict its buffer. A lossy
+       (tunnel) session never buffers, so no ACK is needed. */
+    if (!s->lossy && s->recv.seq - 1 > s->rel.recv_acked) {
         s->rel.recv_acked = s->recv.seq - 1;
         s->rel.ack_due = true;
     }
@@ -701,8 +707,10 @@ static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
     if (n < 0) return TT_E2EE_BAD_STATE;
 
     /* reliable transport: buffer the plaintext tagged {gen, seq} so a
-       desync re-send can recover it under the fresh chain */
-    rel_sent_add(s, rel_gen(s), seq, text, len);
+       desync re-send can recover it under the fresh chain. A lossy (tunnel)
+       session skips this — datagrams are ephemeral and never re-sent, so
+       buffering them would only waste memory. */
+    if (!s->lossy) rel_sent_add(s, rel_gen(s), seq, text, len);
 
     if (do_fold) {
         ratchet_fold(&s->send, fold_dh, fold_ss);
@@ -736,6 +744,32 @@ int tt_session_send(TTSession *s, const TTE2EEEnv *env, const uint8_t *text,
         return 0;
     }
     return emit_frame(s, text, len, out, cap);
+}
+
+/* Lossy (tunnel) channel send: encrypt one datagram as a DATA frame. Unlike
+   tt_session_send, a not-yet-active session DROPS the datagram (lossy
+   semantics — no stash, no re-send). The caller must drain any pending
+   re-key carrier first (see tt_session_rekey_pending) so the datagram fits
+   in a plain DATA frame. */
+int tt_session_send_lossy(TTSession *s, const TTE2EEEnv *env,
+                          const uint8_t *text, size_t len,
+                          uint8_t *out, size_t cap) {
+    (void)env;
+    if (len > TT_FRAME_DATA_MAX) return TT_E2EE_BAD_STATE;
+    if (!s->active) return 0; /* lossy: drop, never stash */
+    return emit_frame(s, text, len, out, cap);
+}
+
+/* True when the next emit_frame would carry a re-key header (REKEY or
+   KEMPUB), which leaves too little room for a full datagram. The tunnel
+   engine drains these as empty carrier frames before sending a datagram. */
+bool tt_session_rekey_pending(const TTSession *s) {
+    if (!s->active) return false;
+    if (s->rekey.rekey_due && s->rekey.peer_have) return true;
+    if (s->rekey.rekey_due && !s->rekey.awaiting_peer) return true;
+    if (s->rekey.post_fold_publish) return true;
+    if (s->rekey.publish_back) return true;
+    return false;
 }
 
 int tt_session_flush(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t cap) {

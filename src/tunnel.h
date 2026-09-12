@@ -8,6 +8,8 @@
 #include <string.h>
 #include <tox/tox.h>
 
+#include "crypto/crypto.h" /* TT_FRAME_HEAD_MAX, TT_MAC16 (E2EE frame budget) */
+
 /* UDP-over-Tox tunnel (lossy channel) + TCP forwarder (lossless channel).
    The engine lives in the tox thread: every tox_* call and all socket I/O
    run there, so no cross-thread queue is involved (the TTEvent queue is for
@@ -55,6 +57,30 @@
 #define TT_TUNNEL_SIG_PACKET_ID 163
 #define TT_TUNNEL_SIG_VERSION   1
 #define TT_TUNNEL_SIG_HEADER    3 /* id + version + opcode */
+
+/* Tunnel E2EE channel (TT_E2EE on): the tunnel's UDP datagrams and TCP
+   payloads ride the PQDR ratchet as E2EE frames, wrapped in these custom
+   packet types so the receiver routes them to the tunnel session decryptor
+   (distinct from the raw 200/162 types used when E2EE is off). The E2EE
+   frame (INIT/REPLY/DATA) is the packet payload after the routing header.
+   Handshake (INIT/REPLY) rides lossless type 164; UDP data rides lossy
+   type 201; TCP data rides lossless type 165. */
+#define TT_TUNNEL_E2EE_SIG_PACKET_ID 164
+#define TT_TUNNEL_E2EE_TCP_PACKET_ID 165
+#define TT_TUNNEL_E2EE_UDP_PACKET_ID 201
+#define TT_TUNNEL_E2EE_VERSION 1
+/* Max UDP datagram payload that fits an E2EE DATA frame: the plaintext is
+   the WHOLE tunnel packet (200 header + payload), so the payload is capped
+   at the frame data budget minus the 3-byte 200 header. The decrypt buffer
+   on the receive side must hold the full plaintext (TT_FRAME_DATA_MAX). */
+#define TT_TUNNEL_E2EE_MAX_DATAGRAM \
+    (TT_FRAME_DATA_MAX - TT_TUNNEL_HEADER)
+/* Max TCP payload that fits an E2EE DATA frame: the plaintext is the WHOLE
+   TCP frame (162 header + payload), so the payload is capped at the frame
+   data budget minus the 6-byte 162 header. The decrypt buffer on the
+   receive side must hold the full plaintext (TT_FRAME_DATA_MAX). */
+#define TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD \
+    (TT_FRAME_DATA_MAX - TT_TUNNEL_TCP_HEADER)
 
 /* Signaling opcodes. */
 enum {
@@ -229,5 +255,27 @@ unsigned tt_tunnel_accept(struct TTToxThread *t, uint32_t fn,
                           const TTPortRangeList *udp, const TTPortRangeList *tcp);
 /* Client: decline a pending invite from fn. */
 void tt_tunnel_decline(struct TTToxThread *t, uint32_t fn);
+
+/* ---- tunnel E2EE channel (TT_E2EE on) ----
+   A SEPARATE per-friend PQDR session for tunnel datagrams (see
+   tox_thread.c). The engine lives in tox_thread.c; tunnel.c calls these to
+   encrypt/decrypt datagrams and to kick the handshake. When E2EE is off,
+   the tunnel falls back to the raw 200/162 types (plaintext over toxcore's
+   transport crypto). */
+
+/* Send one tunnel E2EE frame over a custom packet. kind: 0 = handshake
+   (lossless 164), 1 = UDP data (lossy 201), 2 = TCP data (lossless 165). */
+void tt_tunnel_e2ee_send(struct TTToxThread *t, uint32_t fn, int kind,
+                         const uint8_t *frame, size_t len);
+/* Start (or restart) the tunnel E2EE session with fn as initiator. */
+void tt_tunnel_e2ee_start(struct TTToxThread *t, uint32_t fn);
+/* Engine tick: INIT retransmits for every pending tunnel session. */
+void tt_tunnel_e2ee_tick(struct TTToxThread *t);
+/* Feed one received tunnel E2EE frame. Returns the plaintext length (>0 =
+   DATA to forward), 0 = handshake/control frame consumed, or a negative
+   TTE2EEStatus. */
+int tt_tunnel_e2ee_rx(struct TTToxThread *t, uint32_t fn,
+                      const uint8_t *frame, size_t len,
+                      uint8_t *pt, size_t pt_cap);
 
 #endif

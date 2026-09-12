@@ -303,6 +303,10 @@ typedef struct TTToxThread {
     struct ToxAV *av;   /* owned by the tox thread (toxav.h); NULL = no AV */
     struct TTAvg *avg;  /* AV engine state (src/av.h); valid only while av set */
     struct TTSession *e2ee; /* TT_MAX_FRIENDS sessions (TT_E2EE only); NULL = off */
+    /* Tunnel E2EE channel (TT_E2EE only): a SEPARATE per-friend session for
+       tunnel datagrams, so tunnel frames never interleave with chat seq
+       numbers. NULL = off. In-memory only (tunnels are ephemeral). */
+    struct TTSession *tun_e2ee;
     /* Per-friend E2EE policy (TT_E2EE only). e2ee_required: block plaintext
        fallback for this friend (persisted in the settings sidecar).
        e2ee_fallback: we detected this friend as legacy and fell back to
