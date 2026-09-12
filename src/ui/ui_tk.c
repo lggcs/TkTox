@@ -611,7 +611,8 @@ static void roster_render(Ui *ui) {
         char imgname[8];
         snprintf(imgname, sizeof imgname, "pdot%d", presence_dot(c->presence, c->conn));
         EV(".sb.rf.roster", "insert", "", "end", "-id", iid, "-text", rowtext,
-           "-image", imgname, "-open", "false");
+           "-image", imgname, "-open", "false",
+           "-tags", c->unread > 0 ? "unread" : "");
     }
 
     /* groups section: header row + chat-bubble glyph so group rows read as
@@ -670,6 +671,9 @@ static void roster_colors(Ui *ui) {
     /* group section header: small caps look, never a presence color */
     EV(".sb.rf.roster", "tag", "configure", "ghead", "-foreground", C_HINT,
        "-font", "f_small");
+    /* unread: bold + accent so a 1:1 message stands out (qTox-style) */
+    EV(".sb.rf.roster", "tag", "configure", "unread", "-font", "f_bold",
+       "-foreground", C_LIST_TEXT);
     EV(".sb.rf.roster", "tag", "configure", "st0", "-foreground", C_ONLINE);
     EV(".sb.rf.roster", "tag", "configure", "st1", "-foreground", C_AWAY);
     EV(".sb.rf.roster", "tag", "configure", "st2", "-foreground", C_BUSY);
