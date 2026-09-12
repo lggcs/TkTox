@@ -4730,7 +4730,10 @@ static int cc_gmembers_open(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *co
         snprintf(who, sizeof who, "%s  \xc2\xb7  %s",
                  m->name[0] ? m->name : "peer", role_str(m->role));
         snprintf(lrow, sizeof lrow, ".gm.body.cv.inner.r%s.l", fr);
-        EV("ttk::label", lrow, "-text", who);
+        /* cap the label width so a long name truncates (ellipsis) instead of
+           growing the row past the canvas and pushing the right-packed
+           buttons off; -fill x -expand true still stretches it to fill */
+        EV("ttk::label", lrow, "-text", who, "-width", "40");
         EV("pack", lrow, "-side", "left", "-fill", "x", "-expand", "true");
         /* Ignore/Unignore: local-only mute of a peer's messages (any role
            can ignore; you cannot ignore yourself). */
