@@ -97,6 +97,9 @@ typedef enum {
                                 ival2: 1 = host, 0 = client; str: endpoint */
     TT_EV_TUNNEL_STATE,      /* host: friend_number accepted (ival2=1) or
                                 declined (ival2=2) our invite; ival: tunnel id */
+    TT_EV_TUNNEL_E2EE,       /* a tunnel's E2EE session changed state.
+                                ival: tunnel id; ival2: 1 = E2EE active,
+                                0 = not (raw fallback / handshake pending) */
     TT_EV_TUNNEL_REMOVE,     /* a tunnel was stopped. ival: tunnel id */
     TT_EV_SHUTDOWN,
 } TTEventType;

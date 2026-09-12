@@ -59,6 +59,8 @@ struct TTTunnel {
     bool host;            /* true = host, false = client */
     bool pending;         /* host: invite sent, awaiting accept;
                              client: invite received, awaiting accept/decline */
+    bool e2ee_active;     /* tunnel E2EE session with peer_fn is live (TT_E2EE
+                             on and handshake completed); drives the UI badge */
     uint32_t peer_fn;     /* the friend this tunnel is with (host: invited
                              friend; client: the host). UINT32_MAX = unresolved */
     uint8_t peer_pk[TOX_PUBLIC_KEY_SIZE]; /* friend identity (client: host pk) */
@@ -943,6 +945,17 @@ void tt_tunnel_poll(TTToxThread *t) {
             TTSession *ts = &t->tun_e2ee[tn->peer_fn];
             if (!ts->active && !ts->init_pending && !ts->reply_due)
                 tt_tunnel_e2ee_start(t, tn->peer_fn);
+            /* surface the live E2EE state to the UI (badge) on change */
+            bool live = ts->active;
+            if (live != tn->e2ee_active) {
+                tn->e2ee_active = live;
+                TTEvent *ev = tt_event_new(TT_EV_TUNNEL_E2EE);
+                if (ev) {
+                    ev->ival = (int)tn->id;
+                    ev->ival2 = live ? 1 : 0;
+                    tt_queue_push(&t->out, ev);
+                }
+            }
         }
         if (tn->host) tunnel_poll_host(t, tn);
         else tunnel_poll_client(t, tn);

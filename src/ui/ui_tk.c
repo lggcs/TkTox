@@ -144,6 +144,7 @@ typedef struct TTTunnelUI {
     unsigned id;          /* engine tunnel id */
     bool host;            /* true = host, false = client */
     bool pending;         /* invite sent/received, not yet live */
+    bool e2ee;            /* tunnel E2EE session is live (🔒 badge) */
     uint32_t peer_fn;     /* the friend this tunnel is with (UINT32_MAX = none) */
     char endpoint[300];   /* host: "server_host udp <ports> tcp <ports>";
                              client: "127.0.0.<octet> udp <ports> tcp <ports>" */
@@ -2474,6 +2475,15 @@ static void handle_event(Ui *ui, TTEvent *e) {
         if (ui->tun_panel_open) tun_panel_render(ui);
         break;
     }
+    case TT_EV_TUNNEL_E2EE: {
+        /* a tunnel's E2EE session changed state (🔒 badge). */
+        TTTunnelUI *tn = tun_ui_find(ui, (unsigned)e->ival);
+        if (tn) {
+            tn->e2ee = (e->ival2 != 0);
+            if (ui->tun_panel_open) tun_panel_render(ui);
+        }
+        break;
+    }
     case TT_EV_TUNNEL_REMOVE:
         tun_ui_remove(ui, (unsigned)e->ival);
         if (ui->tun_panel_open) tun_panel_render(ui);
@@ -4076,6 +4086,8 @@ static void tun_panel_render(Ui *ui) {
             snprintf(title, sizeof title, "Joined %s", tn->endpoint);
         }
         if (tn->pending) strncat(title, " (pending)", sizeof title - strlen(title) - 1);
+        /* M5-style 🔒 badge: the tunnel's E2EE session is live */
+        if (tn->e2ee) strncat(title, " \xf0\x9f\x94\x92", sizeof title - strlen(title) - 1);
         char wtitle[80];
         snprintf(wtitle, sizeof wtitle, "%s.title", wname);
         EV("ttk::label", wtitle, "-text", title, "-font", "f_bold");
