@@ -2003,6 +2003,7 @@ static void cb_friend_message(Tox *tox, uint32_t friend_number, Tox_Message_Type
     TTEvent *probe = tt_event_new(TT_EV_FRIEND_MESSAGE);
     if (!probe) return; /* OOM: drop silently, next event still flows */
     probe->friend_number = friend_number;
+    probe->ival = (int)type; /* preserve ACTION vs NORMAL through E2EE */
     probe->str = malloc(length + 1);
     if (probe->str) {
         memcpy(probe->str, message, length);

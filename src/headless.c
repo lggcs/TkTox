@@ -1389,7 +1389,10 @@ int echo_main(const char *profile) {
             if (ev->str) {
                 TT_LOG("echo", "friend %u message: %.*s", ev->friend_number,
                        (int)(ev->str_len > 64 ? 64 : ev->str_len), ev->str);
-                tt_queue_post(&tt.in, TT_CMD_SEND_MESSAGE, ev->friend_number, ev->str, 0);
+                /* preserve the message type so a "/me" action echoes back as
+                   an action ("* Echo Bot ..."), not a plain message */
+                tt_queue_post2(&tt.in, TT_CMD_SEND_MESSAGE, ev->friend_number,
+                               ev->str, 0, ev->ival);
             }
             break;
         /* chess interop: accept invites and mirror the user's moves. The
@@ -1500,7 +1503,10 @@ int echo_main(const char *profile) {
             if (ev->str) {
                 TT_LOG("echo", "group %u msg from peer %u: %.*s", ev->friend_number,
                        (unsigned)ev->ival, (int)(ev->str_len > 64 ? 64 : ev->str_len), ev->str);
-                tt_queue_post(&tt.in, TT_CMD_GROUP_SEND, ev->friend_number, ev->str, 0);
+                /* preserve the message type so a "/me" action echoes back as
+                   an action, not a plain message */
+                tt_queue_post2(&tt.in, TT_CMD_GROUP_SEND, ev->friend_number,
+                               ev->str, 0, ev->ival2);
             }
             break;
         case TT_EV_GROUP_PEER_EXIT:
