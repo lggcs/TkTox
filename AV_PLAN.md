@@ -3,6 +3,11 @@
 Status: PLANNED (not started). 1:1 friend calls via vendored toxav. Ground facts below were
 verified in-tree this session; anything not verified is marked.
 
+E2EE decision (2026-09-14): AV media relies on toxcore's built-in transport E2EE (X25519 +
+ChaCha20-Poly1305). No PQDR layer on the media path — toxav's codec+RTP pipeline is closed and
+media sizes don't fit the E2EE packet channel. See CRYPTO_PLAN.md "AV (voice/video) E2EE".
+This is a transport-layer decision only; it does not change the AV milestones below.
+
 ## Non-goals (explicit)
 
 - **Group voice/video.** The vendored toxcore's NGC groups have no A/V (groupav.c serves the

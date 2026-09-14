@@ -154,6 +154,34 @@ gaming use case.
 - A desync on the tunnel channel re-establishes with a fresh handshake (lossy — there is
   no reliable transport to recover the lost datagram).
 
+## AV (voice/video) E2EE — decision (2026-09-14)
+
+**Decision (user): accept toxcore transport E2EE for AV.** No extra PQDR layer on the media
+path. toxav's codec+RTP path is a closed pipeline — `toxav_audio_send_frame` /
+`toxav_video_send_frame` hand raw PCM/YUV to toxav, which does Opus/VP8 + RTP, then toxcore's
+transport layer encrypts it end-to-end. We cannot inject our PQDR ratchet into that path
+without forking toxcore, and the media sizes don't fit the existing E2EE packet channel:
+
+- Audio: 20 ms mono S16 = **1920 B** > `TT_FRAME_DATA_MAX` (1319 B); 10 ms = 960 B would fit.
+- Video: 1280×720 YUV420 ≈ **1.38 MB** — far too large for any friend-message/custom-packet
+  channel.
+
+So AV relies on toxcore's built-in transport E2EE (the same crypto that protects the
+handshake of our chat/tunnel PQDR sessions). This is defense in depth at the transport layer,
+not the application layer. The chat/tunnel PQDR layer is unaffected.
+
+**Why not the alternatives (evaluated, rejected):**
+- *Custom lossy E2EE media channel* (like tunnels): would need our own media framing + a
+  codec (raw PCM is huge); video is impractical. High effort, high risk.
+- *Fork/vendor toxcore to encrypt the codec path*: cleanest crypto placement but forks
+  toxcore and is the heaviest lift; breaks the "no toxcore modifications" decision (locked
+  decision #1).
+
+**Honest limit:** toxcore's transport E2EE is X25519 + ChaCha20-Poly1305 (classical, not
+PQ). AV media is therefore NOT post-quantum protected, unlike chat/tunnel payloads. If PQ
+AV becomes a requirement, the path is a custom lossy E2EE media channel (audio first) or a
+toxcore fork — both out of scope for now.
+
 ## Honest limits (stated up front)
 
 - AES-GCM path needs ARMv8 crypto extensions; aarch64 dev box has them, but the cipher byte +
