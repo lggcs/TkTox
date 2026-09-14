@@ -314,7 +314,11 @@ static void tunnel_resolve(TTToxThread *t, struct TTTunnel *tn) {
 
 static void sig_send(TTToxThread *t, uint32_t fn, uint8_t opcode,
                      const uint8_t *payload, size_t plen) {
-    uint8_t pkt[TT_TUNNEL_SIG_HEADER + 256];
+    /* payload cap sized for the largest signal (INVITE: 200-byte host +
+       NUL + two counts + 2 * TT_TUNNEL_MAX_RANGES * 4 range bytes = 269);
+       the old 256 cap both overflowed sig_invite's buffer and would have
+       silently dropped worst-case invites */
+    uint8_t pkt[TT_TUNNEL_SIG_HEADER + 270];
     if (plen > sizeof pkt - TT_TUNNEL_SIG_HEADER) return;
     pkt[0] = TT_TUNNEL_SIG_PACKET_ID;
     pkt[1] = TT_TUNNEL_SIG_VERSION;
@@ -330,7 +334,8 @@ static void sig_send(TTToxThread *t, uint32_t fn, uint8_t opcode,
    server_host\0 + udp_count BE16 + udp_ranges (each: start BE16 + count BE16)
    + tcp_count BE16 + tcp_ranges (each: start BE16 + count BE16) */
 static void sig_invite(TTToxThread *t, uint32_t fn, struct TTTunnel *tn) {
-    uint8_t payload[256];
+    /* worst case: 201 host + 1 + 1 + 8*4 + 1 + 8*4 = 269 bytes */
+    uint8_t payload[270];
     size_t hl = strlen(tn->server_host);
     if (hl > 200) hl = 200;
     memcpy(payload, tn->server_host, hl);
@@ -727,8 +732,12 @@ static void conn_free(struct TTTunnelConn *c) {
     c->connecting = false;
 }
 
-/* Append data to a conn's pending buffer (host, while connecting). */
+/* Append data to a conn's pending buffer (host, while connecting).
+   Capped: an authenticated peer can otherwise buffer ~4MB per conn by
+   sending TCP_DATA while connect() stalls (64 conns per tunnel). */
+#define TT_TUNNEL_PEND_MAX 131072u
 static void conn_pend(struct TTTunnelConn *c, const uint8_t *data, size_t len) {
+    if (c->pend_len + len > TT_TUNNEL_PEND_MAX) return;
     if (c->pend_len + len > c->pend_cap) {
         size_t ncap = c->pend_cap ? c->pend_cap * 2 : 4096;
         while (ncap < c->pend_len + len) ncap *= 2;
