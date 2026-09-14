@@ -599,11 +599,10 @@ static void roster_render(Ui *ui) {
         /* M5: 🔒 badge for an established encrypted session (callmark-style) */
         const char *lockmark = c->e2ee ? " \xf0\x9f\x94\x92" : "";
         if (c->unread > 0)
-            /* unread: bold name + count, but no message preview under it */
-            snprintf(rowtext, sizeof rowtext, "%s%s%s (%d)\n%s", disp, lockmark,
-                     callmark, c->unread,
-                     c->status_msg[0] ? c->status_msg
-                                      : presence_str(c->presence, c->conn));
+            /* unread: bold name + count only — no subline, so nothing
+               renders in the tag's white bold under the name */
+            snprintf(rowtext, sizeof rowtext, "%s%s%s (%d)", disp, lockmark,
+                     callmark, c->unread);
         else if (c->last[0] && contact_all_read(c))
             /* last message confirmed read by the friend */
             snprintf(rowtext, sizeof rowtext, "\xe2\x9c\x93 %s%s%s\n%s", disp,
