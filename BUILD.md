@@ -61,6 +61,11 @@ cd TkTox
 bash fetch-deps.sh arm64        # or amd64 / riscv64
 ```
 
+The debs are downloaded over HTTPS. TLS protects the fetch against a
+network MITM but not against a compromised mirror; for hardened builds,
+provision from a local apt mirror or aptly snapshot instead (apt's Release
+signatures verify what a plain curl cannot).
+
 | Vendored pkg | Provides                          |
 |--------------|-----------------------------------|
 | `tcl8.6`     | Tcl 8.6 (UI interpreter)          |

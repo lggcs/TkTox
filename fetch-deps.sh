@@ -19,11 +19,16 @@ ARCH="${1:-arm64}"
 TRIPLET="${2:-}"
 
 case "$ARCH" in
-    arm64)   TRIPLET="${TRIPLET:-aarch64-linux-gnu}"; MIRROR="http://ports.ubuntu.com/ubuntu-ports" ;;
-    amd64)   TRIPLET="${TRIPLET:-x86_64-linux-gnu}";  MIRROR="http://archive.ubuntu.com/ubuntu" ;;
-    riscv64) TRIPLET="${TRIPLET:-riscv64-linux-gnu}"; MIRROR="http://ports.ubuntu.com/ubuntu-ports" ;;
+    arm64)   TRIPLET="${TRIPLET:-aarch64-linux-gnu}"; MIRROR="https://ports.ubuntu.com/ubuntu-ports" ;;
+    amd64)   TRIPLET="${TRIPLET:-x86_64-linux-gnu}";  MIRROR="https://archive.ubuntu.com/ubuntu" ;;
+    riscv64) TRIPLET="${TRIPLET:-riscv64-linux-gnu}"; MIRROR="https://ports.ubuntu.com/ubuntu-ports" ;;
     *) echo "unsupported arch: $ARCH (use arm64|amd64|riscv64)" >&2; exit 1 ;;
 esac
+
+# TLS gives integrity against a network MITM but NOT against a compromised
+# mirror. For pinned-reprovisionable deps this is the practical trade-off;
+# prefer a local apt mirror / aptly snapshot for hardened deployments
+# (apt's Release signatures verify what plain curl cannot).
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 DEPS="$ROOT/vendor/.deps"
