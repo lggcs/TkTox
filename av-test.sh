@@ -30,8 +30,8 @@ if [ ! -x "$BIN" ]; then
     cmake --build build --target TkTox -j4 || exit 1
 fi
 
-rm -f build/av-a.tox build/av-a.tox.oq build/av-a.tox.ses \
-      build/av-b.tox build/av-b.tox.oq build/av-b.tox.ses
+rm -f build/av-a.tox build/av-a.tox.oq build/av-a.tox.ses build/av-a.tox.rsum \
+      build/av-b.tox build/av-b.tox.oq build/av-b.tox.ses build/av-b.tox.rsum
 : > build/av-a.log
 : > build/av-b.log
 

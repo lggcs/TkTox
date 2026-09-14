@@ -19,8 +19,8 @@ if [ ! -x "$BIN" ]; then
     cmake --build build --target TkTox -j4 || exit 1
 fi
 
-rm -f build/ngc-a.tox build/ngc-a.tox.oq build/ngc-a.tox.ses \
-      build/ngc-b.tox build/ngc-b.tox.oq build/ngc-b.tox.ses
+rm -f build/ngc-a.tox build/ngc-a.tox.oq build/ngc-a.tox.ses build/ngc-a.tox.rsum \
+      build/ngc-b.tox build/ngc-b.tox.oq build/ngc-b.tox.ses build/ngc-b.tox.rsum
 : > build/ngc-a.log
 : > build/ngc-b.log
 

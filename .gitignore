@@ -24,6 +24,7 @@ AUDIT_REPORT.md
 *.tox.ses
 *.tox.ava
 *.tox.hist
+*.tox.rsum
 
 # Qwen Code tooling scratch (never commit)
 /.qwen/

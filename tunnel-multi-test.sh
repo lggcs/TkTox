@@ -26,9 +26,9 @@ if [ ! -x "$BIN" ]; then
     cmake --build build-dyn --target TkTox -j4 || exit 1
 fi
 
-rm -f build-dyn/th.tox build-dyn/th.tox.oq build-dyn/th.tox.ses \
-      build-dyn/tc1.tox build-dyn/tc1.tox.oq build-dyn/tc1.tox.ses \
-      build-dyn/tc2.tox build-dyn/tc2.tox.oq build-dyn/tc2.tox.ses \
+rm -f build-dyn/th.tox build-dyn/th.tox.oq build-dyn/th.tox.ses build-dyn/th.tox.rsum \
+      build-dyn/tc1.tox build-dyn/tc1.tox.oq build-dyn/tc1.tox.ses build-dyn/tc1.tox.rsum \
+      build-dyn/tc2.tox build-dyn/tc2.tox.oq build-dyn/tc2.tox.ses build-dyn/tc2.tox.rsum \
       build-dyn/*-got.txt build-dyn/*-err.txt
 : > build-dyn/th.log
 : > build-dyn/tc1.log

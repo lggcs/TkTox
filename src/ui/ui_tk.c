@@ -1884,6 +1884,26 @@ static void handle_event(Ui *ui, TTEvent *e) {
         offer_show(ui, c);
         break;
     }
+    case TT_EV_FILE_RESUMED: {
+        Contact *c = contact_by_fn(ui, e->friend_number);
+        if (!c) break;
+        /* str: "<name>\n<size>"; ival: xfer id. A re-offer auto-resumed an
+           existing partial — the transfer is already accepted, so show a
+           "resuming" line and a Cancel button instead of the accept dialog. */
+        const char *nl = e->str ? strchr(e->str, '\n') : NULL;
+        if (!nl) break;
+        size_t n = (size_t)(nl - e->str);
+        if (n > sizeof c->offer_name - 1) n = sizeof c->offer_name - 1;
+        memcpy(c->offer_name, e->str, n);
+        c->offer_name[n] = '\0';
+        snprintf(c->xfer_name, sizeof c->xfer_name, "%s", c->offer_name);
+        c->xfer_me = false;
+        c->xfer_running = true;
+        c->xfer_run_id = (unsigned)e->ival;
+        xfer_line(ui, c, false, "resuming \xe2\x80\x9c%s\xe2\x80\x9d from a partial download",
+                  c->xfer_name);
+        break;
+    }
     case TT_EV_GROUP_NEW: {
         /* founder side: group object exists locally */
         Group *g = group_add(ui, e->friend_number);

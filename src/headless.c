@@ -269,7 +269,7 @@ static bool echo_test_file_write(void) {
     return test_file_write(TT_TEST_FILE_PATH, TT_TEST_FILE_SIZE);
 }
 
-static bool echo_test_file_verify(void) {
+static bool echo_test_file_verify(uint64_t expect) {
     FILE *fp = fopen(TT_TEST_FILE_RX_PATH, "rb");
     if (!fp) return false;
     unsigned char block[65536], want[65536];
@@ -283,7 +283,7 @@ static bool echo_test_file_verify(void) {
         off += n;
     }
     fclose(fp);
-    return ok && off == TT_TEST_FILE_SIZE;
+    return ok && off == expect;
 }
 
 /* Chess interop test phase (TT_BOT_CHESS): a scripted scholar's mate played
@@ -321,6 +321,18 @@ int bot_main(const char *profile, const char *peer_toxid) {
     bool file_failed = false;
     /* round 25: typing indicator + read receipts + mid-transfer cancel */
     bool cancel_mode = getenv("TT_BOT_CANCEL") != NULL;
+    /* cross-restart file-transfer resume (resume-test.sh): TT_BOT_RESUME=1
+       runs the partial phase (initiator sends the big file and cancels
+       mid-transfer, the responder persists a resumable partial); TT_BOT_RESUME=2
+       restarts BOTH with the SAME profiles and re-sends the SAME file — the
+       responder must auto-resume from the partial (log "auto-resuming") and
+       complete with matching content. */
+    int resume_phase = 0;
+    {
+        const char *rp = getenv("TT_BOT_RESUME");
+        if (rp) resume_phase = atoi(rp);
+    }
+    bool resume_done = false; /* initiator: phase-2 transfer completed */
     bool typing_got = false, receipt_got = false, cancel_test = false;
     bool tx_failed = false, cancel_sent = false;
     unsigned xfer_run = 0;
@@ -434,7 +446,8 @@ int bot_main(const char *profile, const char *peer_toxid) {
         if (!call_offline_test)
             tt_queue_post(&tt.in, TT_CMD_ADD_FRIEND, 0, peer_toxid, 0);
         tt_queue_post(&tt.in, TT_CMD_SET_NAME, 0, "Trench Bot", 0);
-        if (cancel_mode) test_file_write(TT_TEST_FILE_BIG_PATH, TT_TEST_FILE_BIG_SIZE);
+        if (cancel_mode || resume_phase)
+            test_file_write(TT_TEST_FILE_BIG_PATH, TT_TEST_FILE_BIG_SIZE);
     } else {
         tt_queue_post(&tt.in, TT_CMD_SET_NAME, 0, "Echo Bot", 0);
         /* test avatar for manual UI checks: green smiley, ~37KB PNG */
@@ -557,9 +570,16 @@ int bot_main(const char *profile, const char *peer_toxid) {
             if (pong_sent && !initiator && !group_want && !call_solo) {
                 if (file_failed) { /* round 25: FAILED is success in cancel mode */
                     rc = cancel_mode ? 0 : 3;
+                    if (resume_phase == 1) rc = 0; /* phase 1: cancel leaves a partial */
                     break;
                 }
                 if (file_done && file_ok) {
+                    /* resume phase 2: the transfer completed via auto-resume —
+                       exit immediately (no group phase). */
+                    if (resume_phase == 2) {
+                        rc = 0;
+                        break;
+                    }
                     /* stay up ~15s: the founder may still invite us to a group */
                     if (time(NULL) - file_done_at < 15) continue;
                     break; /* reply + file flushed, no invite came */
@@ -716,7 +736,18 @@ int bot_main(const char *profile, const char *peer_toxid) {
                         rc = 2;
                         break;
                     }
-                } else if (rc == 0 && !cancel_mode && !chess_mode &&
+                } else if (resume_phase == 1 && tx_failed) {
+                    /* phase 1: the mid-transfer cancel produced FILE_FAILED
+                       (rc=0) — the responder persisted a resumable partial.
+                       Exit cleanly so the test can restart both peers. */
+                    rc = 0;
+                    break;
+                } else if (resume_phase == 2 && resume_done) {
+                    /* phase 2: the sender finished streaming the whole file
+                       to the auto-resuming receiver — exit cleanly. */
+                    rc = 0;
+                    break;
+                } else if (rc == 0 && !cancel_mode && !chess_mode && !resume_phase &&
                            time(NULL) - pong_at >= 5) {
                     /* M-AV2 solo: the call hold above breaks out instead —
                        never take the round-13 file-phase exit mid-call */
@@ -811,6 +842,14 @@ int bot_main(const char *profile, const char *peer_toxid) {
                     tt_queue_post(&tt.in, TT_CMD_FILE_CANCEL, 0, NULL, (int)xfer_run);
                     cancel_sent = true; /* don't re-cancel on a later progress event */
                 }
+                if (resume_phase == 1 && !cancel_sent) {
+                    /* phase 1: cancel mid-transfer so the responder persists a
+                       resumable partial. Cancel on the first progress event
+                       (the 8 MiB file is still mid-flight). */
+                    TT_LOG("bot", "resume phase 1: cancelling xfer %u mid-transfer", xfer_run);
+                    tt_queue_post(&tt.in, TT_CMD_FILE_CANCEL, 0, NULL, (int)xfer_run);
+                    cancel_sent = true;
+                }
             } else {
                 TT_LOG("bot", "file progress: %s", ev->str ? ev->str : "?");
             }
@@ -818,11 +857,20 @@ int bot_main(const char *profile, const char *peer_toxid) {
         case TT_EV_FILE_DONE:
             if (!initiator) {
                 file_done = true;
-                file_ok = echo_test_file_verify();
+                /* the resume test transfers the 8 MiB big file; the plain
+                   roundtrip uses the 1.5 MiB small file. */
+                uint64_t expect = resume_phase ? TT_TEST_FILE_BIG_SIZE
+                                               : TT_TEST_FILE_SIZE;
+                file_ok = echo_test_file_verify(expect);
                 file_done_at = time(NULL);
                 TT_LOG("bot", "file done: %s — %s", ev->str ? ev->str : "?",
                        file_ok ? "content matches pattern" : "CONTENT MISMATCH");
                 if (file_ok) rc = 0;
+            } else if (resume_phase == 2) {
+                /* phase 2: the sender finished streaming the whole file to
+                   the auto-resuming receiver — the transfer is complete. */
+                resume_done = true;
+                TT_LOG("bot", "resume phase 2: sender finished streaming");
             }
             break;
         case TT_EV_FILE_FAILED:
@@ -830,6 +878,7 @@ int bot_main(const char *profile, const char *peer_toxid) {
                 tx_failed = true;
                 TT_LOG("bot", "file transfer FAILED (tx side) — cancel path green");
                 if (cancel_mode && cancel_test) rc = 0; /* cancel test passed */
+                if (resume_phase == 1) rc = 0; /* phase 1: cancel is the goal */
             } else {
                 file_failed = true;
                 TT_LOG("bot", "file transfer FAILED (rx side)");
@@ -915,10 +964,13 @@ int bot_main(const char *profile, const char *peer_toxid) {
                     if (!file_sent && !call_solo) { /* solo mode: no file phase */
                         /* cancel mode: the small file transfers too fast to
                            cancel mid-flight — send the staged 8 MiB file and
-                           stop after the cancel (no group phase) */
+                           stop after the cancel (no group phase). Resume mode
+                           also uses the big file so a mid-transfer cancel
+                           leaves a resumable partial (same content -> same
+                           file_id across restarts). */
                         const char *fpath = TT_TEST_FILE_PATH;
                         unsigned fsize = TT_TEST_FILE_SIZE;
-                        if (cancel_mode) {
+                        if (cancel_mode || resume_phase) {
                             fpath = TT_TEST_FILE_BIG_PATH;
                             fsize = TT_TEST_FILE_BIG_SIZE;
                         }
@@ -926,6 +978,7 @@ int bot_main(const char *profile, const char *peer_toxid) {
                         tt_queue_post(&tt.in, TT_CMD_SEND_FILE, ev->friend_number, fpath, 0);
                     }
                     if (cancel_mode) break; /* round 25: cancel test exits on FILE_FAILED */
+                    if (resume_phase) break; /* resume test: no group phase */
                     if (!group_want && !call_solo) { /* solo mode: no group phase */
                         group_want = true;
                         pong_fn = ev->friend_number;
@@ -1247,8 +1300,9 @@ int bot_main(const char *profile, const char *peer_toxid) {
         tt_event_free(ev);
     }
     tt_tox_thread_stop(&tt);
-    if (initiator && rc == 0 && !cancel_mode && !call_solo) {
-        /* solo call mode skips the NGC assertion — no group phase ran */
+    if (initiator && rc == 0 && !cancel_mode && !call_solo && !resume_phase) {
+        /* solo call mode skips the NGC assertion — no group phase ran.
+           Resume mode also skips it (no group phase in the resume test). */
         TT_LOG("bot", "NGC roundtrip: %s%s%s%s",
                group_created ? "create ok, " : "CREATE MISSING, ",
                group_pong ? "ngc-pong received, " : "NGC-PONG MISSING, ",

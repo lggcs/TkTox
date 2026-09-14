@@ -103,12 +103,14 @@ set(TT_SOURCES
   src/audio_alsa.c
   src/video_v4l2.c
   src/offline_queue.c
+  src/resume.c
   src/history.c
   src/session_store.c
   src/app_state.c
   src/log.c
   src/tunnel.c
   src/ui/ui_tk.c
+  src/ui/profiles.c
   src/crypto/kdf.c
   src/crypto/aead.c
   src/crypto/kem.c

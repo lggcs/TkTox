@@ -763,6 +763,13 @@ static void cb_file_recv_chunk(Tox *tox, uint32_t friend_number, uint32_t file_n
             return;
         }
         x->got += length;
+        /* keep the resume index's byte count current so a crash mid-transfer
+           leaves a resumable partial at the true offset */
+        if (x->have_file_id) {
+            TTResumeEntry *r = tt_resume_find(t->resume_idx, &t->resume_count,
+                                              x->file_id);
+            if (r) r->bytes = x->got;
+        }
         if (x->got >= x->size) { /* 0-size files complete immediately */
             if (fflush(x->fp) != 0) {
                 TT_LOG("tox", "xfer(%u): flush failed", x->id);
@@ -977,6 +984,11 @@ static void xfer_progress(TTToxThread *t, TTXfer *x) {
     if (!emit && x->got / step != x->got_prev / step) emit = true;
     if (!emit) return;
     x->got_prev = x->got;
+    /* Persist the resume index on progress boundaries so a crash mid-
+       transfer leaves a resumable partial at the true offset. */
+    if (!x->sending && x->have_file_id)
+        tt_resume_save(t->resume_idx, t->resume_count, t->profile_path,
+                       t->pass_key);
     char buf[48];
     snprintf(buf, sizeof buf, "%llu/%llu", (unsigned long long)x->got,
              (unsigned long long)x->size);
@@ -991,6 +1003,11 @@ static void xfer_progress(TTToxThread *t, TTXfer *x) {
 }
 
 static void xfer_failed(TTToxThread *t, TTXfer *x) {
+    /* A receive-side partial is resumable: persist the index so a crash or
+       cancel leaves a partial that a re-offer can auto-resume. */
+    if (!x->sending && x->have_file_id && x->got > 0 && x->got < x->size)
+        tt_resume_save(t->resume_idx, t->resume_count, t->profile_path,
+                       t->pass_key);
     TTEvent *ev = tt_event_new(TT_EV_FILE_FAILED);
     if (ev) {
         ev->friend_number = x->fn;
@@ -1001,6 +1018,13 @@ static void xfer_failed(TTToxThread *t, TTXfer *x) {
 }
 
 static void xfer_done(TTToxThread *t, TTXfer *x) {
+    /* The file is complete: drop the resume entry so a future re-offer
+       starts fresh instead of appending to a finished file. */
+    if (x->have_file_id) {
+        tt_resume_del(t->resume_idx, &t->resume_count, x->file_id);
+        tt_resume_save(t->resume_idx, t->resume_count, t->profile_path,
+                       t->pass_key);
+    }
     TTEvent *ev = tt_event_new(TT_EV_FILE_DONE);
     if (ev) {
         ev->friend_number = x->fn;
@@ -1045,9 +1069,25 @@ static void handle_cmd_send_file(TTToxThread *t, uint32_t fn, const char *path) 
     x->got = 0;
     snprintf(x->name, sizeof x->name, "%s", base);
     snprintf(x->path, sizeof x->path, "%s", path);
+    /* Stable file_id = SHA-256 of the content (the qTox convention). This is
+       the resume key: the receiver persists it with the partial file, so a
+       re-offer of the same file after a restart auto-resumes. toxcore would
+       otherwise generate a fresh random id each run, breaking cross-restart
+       matching. Streamed so large files don't need a full in-memory copy. */
+    {
+        crypto_hash_sha256_state st;
+        crypto_hash_sha256_init(&st);
+        uint8_t buf[65536];
+        size_t n;
+        fseek(fp, 0, SEEK_SET);
+        while ((n = fread(buf, 1, sizeof buf, fp)) > 0)
+            crypto_hash_sha256_update(&st, buf, n);
+        crypto_hash_sha256_final(&st, x->file_id);
+        x->have_file_id = true;
+    }
     Tox_Err_File_Send err;
     x->file_number = tox_file_send(t->tox, fn, TOX_FILE_KIND_DATA,
-                                   (uint64_t)sz, NULL,
+                                   (uint64_t)sz, x->file_id,
                                    (const uint8_t *)x->name, strlen(x->name), &err);
     if (err != TOX_ERR_FILE_SEND_OK) {
         TT_LOG("tox", "send file offer(%u): %d", fn, (int)err);
@@ -1085,6 +1125,59 @@ static void xfer_on_offer(TTToxThread *t, uint32_t fn, uint32_t file_number,
     size_t n = name_len < sizeof x->name - 1 ? name_len : sizeof x->name - 1;
     memcpy(x->name, name, n);
     x->name[n] = '\0';
+    /* The file_id is the resume key: persist it with the partial file so a
+       re-offer after a restart auto-resumes. toxcore always provides one
+       (the sender's stable content hash, or a random id for legacy senders). */
+    if (tox_file_get_file_id(t->tox, fn, file_number, x->file_id, NULL)) {
+        x->have_file_id = true;
+        TTResumeEntry *r = tt_resume_find(t->resume_idx, &t->resume_count, x->file_id);
+        if (r && r->bytes > 0 && r->bytes < file_size) {
+            /* A partial download of this exact file exists: resume it
+               instead of prompting. The partial is opened append-mode and
+               tox_file_seek tells the sender to start at that offset. */
+            int fd = open(r->path, O_RDWR | O_NOFOLLOW);
+            if (fd >= 0) {
+                x->fp = fdopen(fd, "r+b");
+                if (x->fp) {
+                    if (fseek(x->fp, (long)r->bytes, SEEK_SET) == 0) {
+                        x->got = r->bytes;
+                        x->got_prev = r->bytes;
+                        snprintf(x->path, sizeof x->path, "%s", r->path);
+                        x->accepted = true;
+                        Tox_Err_File_Seek serr;
+                        tox_file_seek(t->tox, fn, file_number, r->bytes, &serr);
+                        Tox_Err_File_Control cerr;
+                        tox_file_control(t->tox, fn, file_number,
+                                         TOX_FILE_CONTROL_RESUME, &cerr);
+                        TT_LOG("tox", "file offer(%u): auto-resuming %s at %llu/%llu",
+                               fn, r->path, (unsigned long long)r->bytes,
+                               (unsigned long long)file_size);
+                        /* announce as an accepted transfer so the UI shows
+                           progress and a Cancel button (no accept dialog) */
+                        char evbuf[TOX_MAX_FILENAME_LENGTH + 24];
+                        snprintf(evbuf, sizeof evbuf, "%s\n%llu", x->name,
+                                 (unsigned long long)file_size);
+                        TTEvent *ev = tt_event_new(TT_EV_FILE_RESUMED);
+                        if (ev) {
+                            ev->friend_number = fn;
+                            ev->ival = (int)x->id;
+                            ev->str = strdup(evbuf);
+                            if (ev->str) ev->str_len = strlen(evbuf);
+                            tt_queue_push(&t->out, ev);
+                        }
+                        TT_LOG("tox", "file offer(%u): %s (%llu bytes), xfer id %u",
+                               fn, x->name, (unsigned long long)file_size, x->id);
+                        return;
+                    }
+                    fclose(x->fp);
+                    x->fp = NULL;
+                } else {
+                    close(fd);
+                }
+            }
+            /* fall through: partial unusable, prompt normally */
+        }
+    }
     /* announce; UI posts FILE_ACCEPT(path)/FILE_REJECT */
     char evbuf[TOX_MAX_FILENAME_LENGTH + 24];
     snprintf(evbuf, sizeof evbuf, "%s\n%llu", x->name,
@@ -1165,6 +1258,12 @@ static void handle_cmd_file_accept(TTToxThread *t, uint32_t xfer_id, const char 
     }
     snprintf(x->path, sizeof x->path, "%s", path);
     x->accepted = true;
+    /* Record the partial in the resume index so a re-offer after a restart
+       auto-resumes. Only when we know the file_id (the sender's stable
+       content hash). */
+    if (x->have_file_id)
+        tt_resume_put(t->resume_idx, &t->resume_count, x->file_id, path,
+                      x->got);
     Tox_Err_File_Control cerr;
     tox_file_control(t->tox, x->fn, x->file_number, TOX_FILE_CONTROL_RESUME, &cerr);
     TT_LOG("tox", "file accept(%u): %s", xfer_id, path);
@@ -3502,6 +3601,12 @@ static void *tox_thread_main(void *arg) {
         if (pending > 0) TT_LOG("tox", "offline queue restored: %d message(s)", pending);
     }
 
+    /* restore the cross-restart file-transfer resume index */
+    tt_resume_load(t->resume_idx, &t->resume_count, t->profile_path, t->pass_key);
+    if (t->resume_count > 0)
+        TT_LOG("tox", "file resume index restored: %d partial transfer(s)",
+               t->resume_count);
+
     TT_LOG("tox", "tox thread running, iterating");
     tt_e2ee_mode = tt_e2ee_init_mode();
     if (tt_e2ee_mode) {
@@ -3599,6 +3704,7 @@ static void *tox_thread_main(void *arg) {
     /* Persist profile on shutdown */
     save_profile(t);
     tt_oq_save(&t->oq, t->profile_path, t->pass_key);
+    tt_resume_save(t->resume_idx, t->resume_count, t->profile_path, t->pass_key);
     if (t->e2ee)
         tt_session_store_save(t->e2ee, t->profile_path, t->session_key);
     tt_av_kill(t); /* all active calls forcibly terminated (toxav.h); before tox_kill */

@@ -28,8 +28,8 @@ if [ ! -x "$BIN" ]; then
     cmake --build build-dyn --target TkTox -j4 || exit 1
 fi
 
-rm -f build-dyn/th.tox build-dyn/th.tox.oq build-dyn/th.tox.ses \
-      build-dyn/tc.tox build-dyn/tc.tox.oq build-dyn/tc.tox.ses \
+rm -f build-dyn/th.tox build-dyn/th.tox.oq build-dyn/th.tox.ses build-dyn/th.tox.rsum \
+      build-dyn/tc.tox build-dyn/tc.tox.oq build-dyn/tc.tox.ses build-dyn/tc.tox.rsum \
       build-dyn/server-got.txt build-dyn/client-got.txt \
       build-dyn/tcp-server-got.txt build-dyn/tcp-client-got.txt
 : > build-dyn/th.log

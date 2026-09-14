@@ -239,8 +239,29 @@ Profiles
 <profile>.tox (toxencryptsave-encrypted savedata; passphrase required at
 every start — see "At-rest encryption" above) + <profile>.oq (encrypted
 offline queue) + <profile>.tt (proxy sidecar) + <profile>.ses (encrypted
-E2EE session persistence, v2 — see above). AV settings are session-only —
-nothing to persist.
+E2EE session persistence, v2 — see above) + <profile>.rsum (encrypted
+file-transfer resume index — see "File-transfer resume" below). AV settings
+are session-only — nothing to persist.
+
+Launching `build/TkTox` with no profile argument opens a **profile picker**
+(Tk): list existing profiles in the current directory, plus New / Rename /
+Delete / Open. New and Rename sanitize names to `[A-Za-z0-9._-]` and refuse
+to clobber an existing profile; Rename/Delete also move/remove the profile's
+sidecars (.oq, .tt, .ses, .hist, .ava, .rsum). Passing a profile argument
+(`build/TkTox my.tox`) or any headless mode (`--bot`, `--echo`, `--headless`,
+tunnel modes) bypasses the picker entirely.
+
+File-transfer resume
+--------------------
+A receive-side transfer that is interrupted (cancel, crash, or disconnect)
+persists a resumable partial: the engine records the sender's stable
+`file_id` (the sender's content SHA-256), the destination path, and the byte
+offset in the encrypted `<profile>.rsum` sidecar. When the same file is
+re-offered after a restart, the engine auto-resumes — it seeks the partial
+and sends `TOX_FILE_CONTROL_RESUME` to the sender, so only the missing tail
+is re-downloaded (no accept dialog; the UI shows a "resuming" line). The
+entry is dropped once the transfer completes. Senders use a content-hash
+`file_id` so re-offers of the same file match across restarts.
 
 Tests
 -----
@@ -259,6 +280,8 @@ Tests
     bash e2ee-test.sh replay                     # + re-injected frame rejected as replay
     bash tunnel-test.sh                          # UDP lossy + TCP lossless round-trips over Tox
     bash tunnel-multi-test.sh                    # 2 clients, same ports, distinct loopback octets
+    bash resume-test.sh                          # cross-restart file-transfer resume (partial
+                                                 #   -> cancel -> restart -> auto-resume -> full)
 
 Engine commands beyond the UI buttons (session-only, scriptable):
 TT_CMD_AV_SET_VIDEO_BR (mid-call video kbit/s, 1..1000000) — Pause/Resume

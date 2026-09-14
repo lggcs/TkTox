@@ -31,8 +31,8 @@ if [ ! -x "$BIN" ]; then
     cmake --build build --target TkTox -j4 || exit 1
 fi
 
-rm -f build/e2ee-a.tox build/e2ee-a.tox.oq build/e2ee-a.tox.ses \
-      build/e2ee-b.tox build/e2ee-b.tox.oq build/e2ee-b.tox.ses
+rm -f build/e2ee-a.tox build/e2ee-a.tox.oq build/e2ee-a.tox.ses build/e2ee-a.tox.rsum \
+      build/e2ee-b.tox build/e2ee-b.tox.oq build/e2ee-b.tox.ses build/e2ee-b.tox.rsum
 : > build/e2ee-a.log
 : > build/e2ee-b.log
 

@@ -1,6 +1,7 @@
 #include "tox_thread.h"
 #include "headless.h"
 #include "ui/ui.h"
+#include "ui/profiles.h"
 #include "tunnel.h"
 
 #include "log.h"
@@ -124,7 +125,13 @@ int main(int argc, char **argv) {
         }
         profile = argv[i];
     }
-    if (!profile) profile = "TkTox.tox";
+    if (!profile) {
+        /* No profile on the command line: show the multi-profile picker.
+           It runs before the tox thread starts, so switching profiles is
+           just a choice of which file to open. */
+        profile = tt_profile_picker();
+        if (!profile) return 0; /* user cancelled */
+    }
 
     TTToxThread tt;
     if (!tt_tox_thread_start(&tt, profile, true)) {

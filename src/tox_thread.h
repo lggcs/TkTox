@@ -9,6 +9,7 @@
 #include <tox/tox.h>
 
 #include "offline_queue.h"
+#include "resume.h"
 
 /* Max simultaneous tunnels (mesh topology). Must match tunnel.h. */
 #define TT_TUNNEL_MAX_TUNNELS 16
@@ -38,6 +39,9 @@ typedef enum {
     TT_EV_AVATAR,            /* friend_number, str: friend avatar PNG bytes */
     TT_EV_AVATAR_CLEARED,    /* friend_number: friend removed their avatar */
     TT_EV_FILE_OFFER,        /* friend_number; str: "<name>\n<size>"; ival: xfer id */
+    TT_EV_FILE_RESUMED,      /* friend_number; str: "<name>\n<size>"; ival: xfer id.
+                                A re-offer auto-resumed an existing partial —
+                                the transfer is already accepted (no dialog). */
     TT_EV_FILE_PROGRESS,     /* friend_number, ival: xfer id, str: "<got>/<total>" */
     TT_EV_FILE_DONE,         /* friend_number, ival: xfer id, str: save path */
     TT_EV_FILE_FAILED,       /* friend_number, ival: xfer id */
@@ -222,6 +226,8 @@ typedef struct TTXfer {
     bool accepted;                  /* RX: user accepted; TX: implicit */
     FILE *fp;
     uint64_t size, got, got_prev;   /* got_prev: last xfer_progress emit */
+    uint8_t file_id[TOX_FILE_ID_LENGTH]; /* content SHA-256 (resume key) */
+    bool have_file_id;
     char name[TOX_MAX_FILENAME_LENGTH + 1];
     char path[1024];                /* local path: source (TX) or dest (RX) */
 } TTXfer;
@@ -298,6 +304,11 @@ typedef struct TTToxThread {
     unsigned char sent_hash[TT_MAX_FRIENDS][TOX_HASH_LENGTH];
     TTXfer xfers[TT_MAX_XFERS];     /* general file transfers */
     unsigned xfer_seq;              /* monotonic xfer ids (0 never issued) */
+    /* Cross-restart resume index: maps a content-derived file_id to the
+       local partial file + bytes received, so a re-offer after a restart
+       auto-resumes. Persisted encrypted beside the profile (<profile>.rsum). */
+    TTResumeEntry resume_idx[TT_RESUME_MAX];
+    int resume_count;
     TTGroupInvite ginvites[TT_MAX_GROUP_INVITES]; /* pending friend invites */
     TTOfflineQueue oq;  /* faux offline messages (persisted <profile>.oq) */
     bool oq_flushing;   /* suppress nested flush from the callback chain */

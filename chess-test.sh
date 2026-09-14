@@ -24,8 +24,8 @@ if [ ! -x "$BIN" ]; then
     cmake --build build --target TkTox -j4 || exit 1
 fi
 
-rm -f build/chess-a.tox build/chess-a.tox.oq build/chess-a.tox.ses \
-      build/chess-b.tox build/chess-b.tox.oq build/chess-b.tox.ses
+rm -f build/chess-a.tox build/chess-a.tox.oq build/chess-a.tox.ses build/chess-a.tox.rsum \
+      build/chess-b.tox build/chess-b.tox.oq build/chess-b.tox.ses build/chess-b.tox.rsum
 : > build/chess-a.log
 : > build/chess-b.log
 
