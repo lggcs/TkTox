@@ -61,11 +61,14 @@ static int relay(TTSession *from, TTE2EEEnv *ef, const void *text, size_t len,
 }
 
 static void test_layer_switch(void) {
+    /* E2EE is ON by default; only an explicit TT_E2EE=0 disables it */
     unsetenv("TT_E2EE");
+    CHECK(tt_e2ee_init_mode());
+    setenv("TT_E2EE", "0", 1);
     CHECK(!tt_e2ee_init_mode());
     setenv("TT_E2EE", "1", 1);
     CHECK(tt_e2ee_init_mode());
-    setenv("TT_E2EE", "", 1);
+    setenv("TT_E2EE", "", 1); /* empty does not disable */
     CHECK(tt_e2ee_init_mode());
     unsetenv("TT_E2EE");
 }
