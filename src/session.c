@@ -613,22 +613,39 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
     if (d.hdr_len == TT_HDR_DATA_REKEY) {
         uint8_t ss[TT_KEY32], dh[TT_KEY32];
         tt_kem_dec(ss, d.hdr, s->rekey.kem_sk);
-        tt_dh_shared(dh, s->rekey.eph_sk, d.hdr + TT_HDR_DATA_DH_OFF);
-        ratchet_fold(&s->recv, dh, ss);
-        memcpy(s->rekey.peer_eph_pk, d.hdr + TT_HDR_DATA_DH_OFF, TT_KEY32);
+        /* contributory check: a rejected DH (small-order peer point)
+           leaves dh unwritten — folding it would mix uninitialized stack
+           into the root. Skip the fold (and the peer eph pk store) and
+           keep the pre-fold chain; an honest sender can never send a
+           small-order eph point (its own fold would have failed), so
+           skipping cannot desync a genuine peer. */
+        if (tt_dh_shared(dh, s->rekey.eph_sk, d.hdr + TT_HDR_DATA_DH_OFF) == 0) {
+            ratchet_fold(&s->recv, dh, ss);
+            memcpy(s->rekey.peer_eph_pk, d.hdr + TT_HDR_DATA_DH_OFF, TT_KEY32);
+        }
         sodium_memzero(ss, sizeof ss);
         sodium_memzero(dh, sizeof dh);
     } else if (d.hdr_len == TT_HDR_DATA_KEMPUB) {
-        memcpy(s->rekey.peer_kem_pk, d.hdr, TT_KEM_PK);
-        memcpy(s->rekey.peer_eph_pk, d.hdr + TT_KEM_PK, TT_KEY32);
-        s->rekey.peer_have = true;
-        if (s->rekey.awaiting_peer) {
-            /* we published and were waiting: now we can fold our direction */
-            s->rekey.awaiting_peer = false;
-            s->rekey.rekey_due = true;
-        } else if (s->rekey.have_kem && !s->rekey.published) {
-            /* publish ours back so the peer can fold its direction */
-            s->rekey.publish_back = true;
+        /* reject the published eph pk unless it is contributory with OUR
+           re-key eph sk — exactly the DH emit_frame will run when folding
+           the peer's direction, so a point it would reject can never be
+           stored (and later folded). The KEM pk needs no check: tt_kem_dec
+           has implicit rejection and handles arbitrary bytes. */
+        uint8_t probe[TT_KEY32];
+        int ok = tt_dh_shared(probe, s->rekey.eph_sk, d.hdr + TT_KEM_PK) == 0;
+        sodium_memzero(probe, sizeof probe);
+        if (ok) {
+            memcpy(s->rekey.peer_kem_pk, d.hdr, TT_KEM_PK);
+            memcpy(s->rekey.peer_eph_pk, d.hdr + TT_KEM_PK, TT_KEY32);
+            s->rekey.peer_have = true;
+            if (s->rekey.awaiting_peer) {
+                /* we published and were waiting: now we can fold our direction */
+                s->rekey.awaiting_peer = false;
+                s->rekey.rekey_due = true;
+            } else if (s->rekey.have_kem && !s->rekey.published) {
+                /* publish ours back so the peer can fold its direction */
+                s->rekey.publish_back = true;
+            }
         }
     }
 
@@ -659,13 +676,19 @@ static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
         s->rekey.rekey_due = true;
 
     if (s->rekey.rekey_due && s->rekey.peer_have) {
-        /* REKEY: fold our send direction after encrypting */
-        tt_kem_enc(hdr, fold_ss, s->rekey.peer_kem_pk);
-        tt_dh_shared(fold_dh, s->rekey.eph_sk, s->rekey.peer_eph_pk);
-        memcpy(hdr + TT_HDR_DATA_DH_OFF, s->rekey.eph_pk, TT_KEY32);
-        hdr_len = TT_HDR_DATA_REKEY;
-        flags |= TT_FRAME_FLAG_KEM | TT_FRAME_FLAG_PK;
-        do_fold = true;
+        /* REKEY: fold our send direction after encrypting. The peer's
+           keys passed the contributory check on receipt, so the DH
+           cannot normally fail; on rejection (small-order point) skip
+           the REKEY header entirely — a plain frame goes out and the
+           re-key stays pending, instead of folding unwritten dh[] into
+           the send root. */
+        if (tt_dh_shared(fold_dh, s->rekey.eph_sk, s->rekey.peer_eph_pk) == 0) {
+            tt_kem_enc(hdr, fold_ss, s->rekey.peer_kem_pk);
+            memcpy(hdr + TT_HDR_DATA_DH_OFF, s->rekey.eph_pk, TT_KEY32);
+            hdr_len = TT_HDR_DATA_REKEY;
+            flags |= TT_FRAME_FLAG_KEM | TT_FRAME_FLAG_PK;
+            do_fold = true;
+        }
     } else if (s->rekey.rekey_due && !s->rekey.awaiting_peer) {
         /* publish our keys first (peer does not have them yet) */
         if (!s->rekey.have_kem) {

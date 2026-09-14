@@ -116,7 +116,11 @@ in-memory session, so forward secrecy is best-effort, not absolute.
   out-of-order frames (maxSkip 512, ring cap 96), derive-without-commit receive hygiene
   (corrupt/replayed frames never consume chain state). Re-key material rides DATA hdrs:
   KEMPUB (1190B, flag PK) publishes fresh keys, REKEY (1071B, flags KEM|PK) folds the
-  direction; auto-trigger every 64 frames. `tests/test_session.c` out_of_order now expects
+  direction; auto-trigger every 64 frames. Both folds are contributory: a peer DH point
+  crypto_scalarmult rejects (small order) skips the fold and the pre-fold chain continues,
+  and a KEMPUB eph pk is checked the same way before being stored — a rejected point would
+  otherwise fold uninitialized stack into the ratchet root
+  (`tests/test_rekey.c` covers the rejected + honest re-key cycles). `tests/test_session.c` out_of_order now expects
   M4 skipped-key recovery; `tests/test_frame.c` roundtrips the REKEY/KEMPUB hdrs (frame.c
   reserved-bit mask 0xF8→0xF0 so the new PK flag 0x08 is accepted). e2ee-test.sh gained
   `reorder` (deliver seq 3,2,4 out of order; responder recovers 2,3 via the skipped store,
