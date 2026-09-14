@@ -11,6 +11,12 @@ build/*.tox
 build/*.tox.*
 build/test_*
 
+# Security-audit scratch (evidence logs + PoC harnesses + report; local only)
+audit-*.txt
+audit-cve/
+tests/audit_*.c
+AUDIT_REPORT.md
+
 # Runtime profiles (user data — never commit)
 *.tox
 *.tox.oq
