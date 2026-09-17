@@ -18,6 +18,10 @@ build/test_*
 /e2ee-out.log
 /*.o
 
+# Release archives (regenerable; distributed out of band)
+/TkTox-*.zip
+/TkTox-*.zip.sha256
+
 # Security-audit scratch (evidence logs + PoC harnesses + report; local only)
 audit-*.txt
 audit-cve/
