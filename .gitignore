@@ -11,6 +11,13 @@ build/*.tox
 build/*.tox.*
 build/test_*
 
+# Build/verification scratch (logs at the repo root)
+/win-*.log
+/linux-*.log
+/t-*.log
+/e2ee-out.log
+/*.o
+
 # Security-audit scratch (evidence logs + PoC harnesses + report; local only)
 audit-*.txt
 audit-cve/

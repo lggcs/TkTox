@@ -1,5 +1,6 @@
 #include "tox_thread.h"
 #include "headless.h"
+#include "selfcheck.h"
 #include "ui/ui.h"
 #include "ui/profiles.h"
 #include "tunnel.h"
@@ -12,6 +13,11 @@ int main(int argc, char **argv) {
     const char *profile = NULL;
     const char *peer = NULL;
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--selfcheck") == 0) {
+            /* Platform + bundled-resource probe; no profile or network.
+               Run this first on a fresh Windows host. */
+            return selfcheck_main();
+        }
         if (strcmp(argv[i], "--headless") == 0) {
             profile = (i + 1 < argc) ? argv[i + 1] : "TkTox.tox";
             return headless_main(profile);

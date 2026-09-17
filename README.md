@@ -136,10 +136,34 @@ target processor):
       -DCMAKE_BUILD_TYPE=Release
     cmake --build build-amd64 --target TkTox -j4
 
+Windows (mingw-w64 cross-compile): a separate dep tree, a separate toolchain
+file, and no `env.sh` (set `PKG_CONFIG_PATH` yourself). `TT_LINK_MODE`
+defaults to `static`, so the result is a self-contained `build-win/` you can
+copy to a Windows machine as-is. See BUILD.md §5 for the full list of
+mingw-specific requirements.
+
+    bash fetch-deps-win.sh              # tcl, tk, sodium, opus, vpx + runtime DLLs
+    PKG_CONFIG_PATH="$PWD/vendor/.deps-win/tcl/lib/pkgconfig:\
+    $PWD/vendor/.deps-win/tk/lib/pkgconfig:\
+    $PWD/vendor/.deps-win/sodium/lib/pkgconfig:\
+    $PWD/vendor/.deps-win/opus/lib/pkgconfig:\
+    $PWD/vendor/.deps-win/vpx/lib/pkgconfig" \
+    cmake -S . -B build-win \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/cross-mingw.cmake \
+      -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-win -j4
+
 Run
 ---
     ./test-ui.sh [profile.tox]     # Tk UI + a long-lived echo bot for manual testing
     build/TkTox                # Tk UI (normal mode)
+
+Diagnostics (run first on a new machine or after moving a Windows build):
+    --selfcheck                    platform glue, Tcl/Tk trees, crypto, engine
+The self-check needs no profile, network, or display: it resolves the same
+Tcl/Tk script trees the UI uses (on Windows, the staged copy beside the
+exe), boots an interpreter, and creates a throwaway tox instance. Exits 0
+when everything is present, 1 with a per-check report otherwise.
 
 Headless modes (regression/automation; see ngc-test.sh / av-test.sh):
     --bot PROFILE [PEER_TOXID]     scripted bot (message/file/group/call phases)

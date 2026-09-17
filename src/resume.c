@@ -3,8 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include "platform.h" /* rename/unlink shims (POSIX passthrough) */
 
 #include <tox/toxencryptsave.h>
 
@@ -95,7 +94,7 @@ void tt_resume_save(const TTResumeEntry *idx, int count, const char *profile_pat
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *fp = fopen(tmp, "wb");
     if (!fp) return;
-    fchmod(fileno(fp), 0600);
+    tt_fchmod(fileno(fp), 0600);
     fwrite(TT_RESUME_MAGIC, 1, 5, fp);
     for (int i = 0; i < count; i++) {
         const TTResumeEntry *e = &idx[i];
@@ -138,16 +137,16 @@ void tt_resume_save(const TTResumeEntry *idx, int count, const char *profile_pat
         snprintf(tmp2, sizeof tmp2, "%s.enc", path);
         FILE *ef = fopen(tmp2, "wb");
         if (!ef) { free(ct); remove(tmp); return; }
-        fchmod(fileno(ef), 0600);
+        tt_fchmod(fileno(ef), 0600);
         fwrite(ct, 1, ct_len, ef);
         fclose(ef);
         free(ct);
-        if (rename(tmp2, path) != 0) { remove(tmp2); remove(tmp); return; }
+        if (tt_rename(tmp2, path) != 0) { remove(tmp2); remove(tmp); return; }
         remove(tmp);
         return;
     }
 
-    if (rename(tmp, path) != 0) remove(tmp);
+    if (tt_rename(tmp, path) != 0) remove(tmp);
 }
 
 TTResumeEntry *tt_resume_find(TTResumeEntry *idx, int *count,

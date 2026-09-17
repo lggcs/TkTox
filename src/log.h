@@ -1,5 +1,9 @@
 #ifndef TT_LOG_H
-#define TT_LOG_H
+#ifdef _WIN32
+/* mingw: %zu needs the ANSI-stdio shim and localtime_r is gated behind
+   _POSIX_C_SOURCE; platform.h sets both before any CRT header. */
+#include "platform.h"
+#endif
 #include <stdio.h>
 #include <time.h>
 
@@ -17,4 +21,5 @@
                 component, ##__VA_ARGS__);                              \
     } while (0)
 
+#define TT_LOG_H
 #endif

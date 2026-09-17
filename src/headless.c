@@ -3,14 +3,11 @@
 #include "log.h"
 #include "chess.h"
 #include "tunnel.h"
+#include "platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <signal.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <tox/toxav.h>
 
 static volatile sig_atomic_t g_stop = 0;
@@ -27,14 +24,14 @@ static uint16_t echo_free_port(int type, uint16_t start) {
     for (int k = 0; k < 200; k++) {
         uint16_t p = (uint16_t)(base + k);
         if (p == 0) break;
-        int s = socket(AF_INET, type, 0);
+        int s = tt_socket(AF_INET, type, 0);
         if (s < 0) continue;
         struct sockaddr_in a = {0};
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         a.sin_port = htons(p);
-        int ok = bind(s, (struct sockaddr *)&a, sizeof a) == 0;
-        close(s);
+        int ok = tt_bind(s, (struct sockaddr *)&a, sizeof a) == 0;
+        tt_close(s);
         if (ok) return p;
     }
     return 0;
@@ -1685,7 +1682,7 @@ int offline_test_main(const char *profile, const char *peer_toxid, bool phase_b)
         char oqpath[1100];
         snprintf(oqpath, sizeof oqpath, "%s.oq", profile);
         for (int i = 0; i < 20 && access(oqpath, F_OK) != 0; i++)
-            usleep(100 * 1000);
+            tt_usleep(100 * 1000);
         if (access(oqpath, F_OK) == 0) {
             TT_LOG("bot", "phase A: message queued, sidecar %s exists", oqpath);
             rc = 0;

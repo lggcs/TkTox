@@ -5,6 +5,7 @@
 #include "session.h"
 #include "session_store.h"
 #include "tunnel.h"
+#include "platform.h"
 #include <tox/toxencryptsave.h>
 #include <sodium.h>
 #include <stdlib.h>
@@ -12,9 +13,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include <time.h>
 
 /* used by callbacks registered long before its definition below */
 static void push_simple(TTToxThread *t, TTEventType type, uint32_t fn, const char *s, size_t len, int ival);
@@ -549,7 +548,7 @@ bool tt_settings_store_proxy(const char *profile_path, const char *host, long po
         }
         fclose(old);
     }
-    if (fclose(fp) != 0 || rename(tmp, path) != 0) {
+    if (fclose(fp) != 0 || tt_rename(tmp, path) != 0) {
         unlink(tmp);
         return false;
     }
@@ -579,7 +578,7 @@ bool tt_settings_store_history(const char *profile_path, bool on) {
         fclose(old);
     }
     fprintf(fp, "history %s\n", on ? "on" : "off");
-    if (fclose(fp) != 0 || rename(tmp, path) != 0) {
+    if (fclose(fp) != 0 || tt_rename(tmp, path) != 0) {
         unlink(tmp);
         return false;
     }
@@ -642,7 +641,7 @@ bool tt_settings_store_e2ee(const bool required[TT_MAX_FRIENDS],
         fprintf(fp, " %u", fn);
     }
     if (!first) fputc('\n', fp);
-    if (fclose(fp) != 0 || rename(tmp, path) != 0) {
+    if (fclose(fp) != 0 || tt_rename(tmp, path) != 0) {
         unlink(tmp);
         return false;
     }
@@ -2211,7 +2210,7 @@ static void save_profile(TTToxThread *t) {
     snprintf(tmp, sizeof tmp, "%s.tmp", t->profile_path);
     FILE *fp = fopen(tmp, "wb");
     if (fp) {
-        fchmod(fileno(fp), 0600);
+        tt_fchmod(fileno(fp), 0600);
         if (t->pass_key) {
             size_t ct_len = ssz + TOX_PASS_ENCRYPTION_EXTRA_LENGTH;
             uint8_t *ct = malloc(ct_len);
@@ -2228,7 +2227,7 @@ static void save_profile(TTToxThread *t) {
             fwrite(sd, 1, ssz, fp);
         }
         fclose(fp);
-        if (rename(tmp, t->profile_path) != 0) remove(tmp);
+        if (tt_rename(tmp, t->profile_path) != 0) remove(tmp);
     }
     free(sd);
 }
@@ -3242,7 +3241,11 @@ static char *tt_passphrase_acquire(TTToxThread *t) {
         return pass;
     }
     if (isatty(STDIN_FILENO)) {
+        #ifdef _WIN32
+        char *p = tt_getpass("TkTox profile passphrase: ");
+#else
         char *p = getpass("TkTox profile passphrase: ");
+#endif
         if (p) return strdup(p);
         return NULL;
     }
@@ -3428,7 +3431,7 @@ static void *tox_thread_main(void *arg) {
     /* Both at-rest keys are derived; drop the passphrase from the process
        environment so it is not visible via /proc/<pid>/environ or inherited
        by child processes. */
-    unsetenv("TT_PASSPHRASE");
+    tt_unsetenv("TT_PASSPHRASE");
 
     /* Profile load/save: savedata blob handled as opaque per toxcore docs.
        tox_options_set_savedata_data stores a non-owned pointer, so the buffer
@@ -3743,6 +3746,10 @@ static void *tox_thread_main(void *arg) {
 }
 
 bool tt_tox_thread_start(TTToxThread *t, const char *profile_path, bool gui_mode) {
+    if (!tt_net_init()) { /* winsock startup (no-op on POSIX) */
+        TT_LOG("tox", "network subsystem init failed");
+        return false;
+    }
     memset(t, 0, sizeof *t);
     tt_queue_init(&t->out);
     tt_queue_init(&t->in);

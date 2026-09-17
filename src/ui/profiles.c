@@ -9,8 +9,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <dirent.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include "platform.h" /* rename/unlink/mkdir shims (POSIX passthrough) */
 
 /* ---- minimal Tcl/Tk bootstrap (mirrors ui_run) ---- */
 
@@ -220,7 +219,7 @@ static int pk_rename_ok(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const 
         char o[600], n[600];
         snprintf(o, sizeof o, "%s%s", oldpath, suffixes[k]);
         snprintf(n, sizeof n, "%s%s", newpath, suffixes[k]);
-        if (access(o, F_OK) == 0) rename(o, n);
+        if (access(o, F_OK) == 0) tt_rename(o, n);
     }
     pk->rename_open = false;
     ev(pk->interp, "destroy .pk.ren");
@@ -329,8 +328,8 @@ char *tt_profile_picker(void) {
     Picker *pk = &g_pk;
 
     Tcl_FindExecutable("TkTox");
-    setenv("TCL_LIBRARY", TT_TCL_SCRIPT_DIR, 1);
-    setenv("TK_LIBRARY", TT_TK_SCRIPT_DIR, 1);
+    setenv("TCL_LIBRARY", tt_tcl_script_dir(), 1);
+    setenv("TK_LIBRARY", tt_tk_script_dir(), 1);
     pk->interp = Tcl_CreateInterp();
     if (!pk->interp) { TT_LOG("prof", "Tcl_CreateInterp failed"); return NULL; }
     if (Tcl_Init(pk->interp) != TCL_OK) {

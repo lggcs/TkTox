@@ -2,16 +2,11 @@
 #include "tox_thread.h"
 #include "session.h"
 #include "log.h"
+#include "platform.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 
 /* ---- state ---- */
 
@@ -116,18 +111,16 @@ static bool pk_equal(const uint8_t a[TOX_PUBLIC_KEY_SIZE],
 }
 
 static int udp_socket(void) {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int s = tt_socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0) return -1;
-    int fl = fcntl(s, F_GETFL, 0);
-    if (fl >= 0) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    tt_nonblock(s);
     return s;
 }
 
 static int tcp_socket(void) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = tt_socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
-    int fl = fcntl(s, F_GETFL, 0);
-    if (fl >= 0) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    tt_nonblock(s);
     return s;
 }
 
@@ -163,8 +156,8 @@ static int bind_udp_local(uint8_t ip, uint16_t port) {
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl((INADDR_LOOPBACK & 0xffffff00) | ip);
     a.sin_port = htons(port);
-    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) {
-        close(s);
+    if (tt_bind(s, (struct sockaddr *)&a, sizeof a) < 0) {
+        tt_close(s);
         return -1;
     }
     return s;
@@ -175,13 +168,14 @@ static int bind_tcp_local(uint8_t ip, uint16_t port) {
     int s = tcp_socket();
     if (s < 0) return -1;
     int one = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl((INADDR_LOOPBACK & 0xffffff00) | ip);
     a.sin_port = htons(port);
-    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 || listen(s, 16) < 0) {
-        close(s);
+    if (tt_bind(s, (struct sockaddr *)&a, sizeof a) < 0 ||
+        tt_listen(s, 16) < 0) {
+        tt_close(s);
         return -1;
     }
     return s;
@@ -215,7 +209,7 @@ static bool bind_client_local(TTToxThread *t, struct TTTunnel *tn) {
             bound++;
         }
         if (!ok) {
-            for (unsigned i = 0; i < bound; i++) close(tn->listen_sock[i]);
+            for (unsigned i = 0; i < bound; i++) tt_close(tn->listen_sock[i]);
             continue;
         }
         /* try to bind all TCP ports on this octet */
@@ -227,8 +221,8 @@ static bool bind_client_local(TTToxThread *t, struct TTTunnel *tn) {
             tbound++;
         }
         if (!ok) {
-            for (unsigned i = 0; i < tbound; i++) close(tn->tcp_listen_sock[i]);
-            for (unsigned i = 0; i < nu; i++) close(tn->listen_sock[i]);
+            for (unsigned i = 0; i < tbound; i++) tt_close(tn->tcp_listen_sock[i]);
+            for (unsigned i = 0; i < nu; i++) tt_close(tn->listen_sock[i]);
             continue;
         }
         tn->local_ip = ip;
@@ -284,14 +278,14 @@ static void tunnel_free(TTToxThread *t, struct TTTunnel *tn) {
     if (tn->host) {
         for (int i = 0; i < TT_MAX_FRIENDS * TT_TUNNEL_MAX_PORTS; i++)
             if (tn->socks[i].used && tn->socks[i].sock >= 0)
-                close(tn->socks[i].sock);
+                tt_close(tn->socks[i].sock);
         for (int i = 0; i < TT_TUNNEL_MAX_CONNS; i++)
             if (tn->conns[i].used && tn->conns[i].sock >= 0)
-                close(tn->conns[i].sock);
+                tt_close(tn->conns[i].sock);
     } else {
         for (int i = 0; i < TT_TUNNEL_MAX_PORTS; i++) {
-            if (tn->listen_sock[i] >= 0) close(tn->listen_sock[i]);
-            if (tn->tcp_listen_sock[i] >= 0) close(tn->tcp_listen_sock[i]);
+            if (tn->listen_sock[i] >= 0) tt_close(tn->listen_sock[i]);
+            if (tn->tcp_listen_sock[i] >= 0) tt_close(tn->tcp_listen_sock[i]);
         }
     }
     for (int i = 0; i < TT_TUNNEL_MAX_TUNNELS; i++)
@@ -599,7 +593,7 @@ bool tt_tunnel_deny(TTToxThread *t, unsigned id, const char *pk_hex) {
         if (!a->used || !pk_equal(a->pk, pk)) continue;
         if (a->fn != UINT32_MAX && a->fn < TT_MAX_FRIENDS) {
             TTTunnelSock *s = &tn->socks[a->fn];
-            if (s->used && s->sock >= 0) close(s->sock);
+            if (s->used && s->sock >= 0) tt_close(s->sock);
             s->used = false;
             s->sock = -1;
         }
@@ -621,7 +615,7 @@ static int host_sock(struct TTTunnel *tn, uint32_t fn, uint16_t port_idx) {
     if (fd < 0) return -1;
     struct sockaddr_in srv;
     if (!resolve_addr(tn->server_host, tt_port_list_port(&tn->udp, port_idx), &srv)) {
-        close(fd);
+        tt_close(fd);
         return -1;
     }
     s->used = true;
@@ -643,7 +637,7 @@ static void host_forward(struct TTTunnel *tn, uint32_t fn, uint16_t port_idx,
     if (!allowed) return;
     int fd = host_sock(tn, fn, port_idx);
     if (fd < 0) return;
-    sendto(fd, data, len, 0,
+    tt_sendto(fd, data, len, 0,
            (struct sockaddr *)&tn->socks[fn * TT_TUNNEL_MAX_PORTS + port_idx].srv,
            sizeof tn->socks[fn * TT_TUNNEL_MAX_PORTS + port_idx].srv);
 }
@@ -723,7 +717,7 @@ static TTTunnelConn *conn_alloc(struct TTTunnel *tn) {
 }
 
 static void conn_free(struct TTTunnelConn *c) {
-    if (c->sock >= 0) close(c->sock);
+    if (c->sock >= 0) tt_close(c->sock);
     free(c->pend);
     c->pend = NULL;
     c->pend_len = c->pend_cap = 0;
@@ -829,7 +823,7 @@ static void host_open_conn(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
         tcp_send(t, fn, port_idx, connid, TT_TCP_OPEN_FAIL, NULL, 0);
         return;
     }
-    int rc = connect(c->sock, (struct sockaddr *)&srv, sizeof srv);
+    int rc = tt_connect(c->sock, (struct sockaddr *)&srv, sizeof srv);
     if (rc == 0) {
         tcp_send(t, fn, port_idx, connid, TT_TCP_OPEN_ACK, NULL, 0);
     } else if (errno == EINPROGRESS) {
@@ -845,7 +839,7 @@ static void host_open_conn(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
 static bool conn_drain(TTToxThread *t, TTTunnelConn *c) {
     uint8_t buf[TT_TUNNEL_TCP_MAX_PAYLOAD];
     for (;;) {
-        ssize_t n = recv(c->sock, buf, sizeof buf, 0);
+        ssize_t n = tt_recv(c->sock, buf, sizeof buf, 0);
         if (n > 0) {
             tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_DATA, buf, (size_t)n);
             continue;
@@ -864,7 +858,7 @@ static void tunnel_poll_host(TTToxThread *t, struct TTTunnel *tn) {
         TTTunnelSock *s = &tn->socks[i];
         if (!s->used || s->sock < 0) continue;
         uint8_t buf[TT_TUNNEL_MAX_DATAGRAM];
-        ssize_t n = recv(s->sock, buf, sizeof buf, 0);
+        ssize_t n = tt_recv(s->sock, buf, sizeof buf, 0);
         if (n > 0) tunnel_send(t, s->fn, s->port_idx, buf, (size_t)n);
     }
     /* TCP: finish pending connects, then drain each conn */
@@ -874,13 +868,14 @@ static void tunnel_poll_host(TTToxThread *t, struct TTTunnel *tn) {
         if (c->connecting) {
             int err = 0;
             socklen_t elen = sizeof err;
-            if (getsockopt(c->sock, SOL_SOCKET, SO_ERROR, &err, &elen) == 0) {
+            if (getsockopt(c->sock, SOL_SOCKET, SO_ERROR, (char *)&err,
+                           &elen) == 0) {
                 if (err == 0) {
                     c->connecting = false;
                     tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_OPEN_ACK, NULL, 0);
                     /* flush any data buffered while connecting */
                     if (c->pend_len) {
-                        send(c->sock, c->pend, c->pend_len, 0);
+                        tt_send(c->sock, c->pend, c->pend_len, 0);
                         c->pend_len = 0;
                     }
                 } else {
@@ -906,7 +901,7 @@ static void tunnel_poll_client(TTToxThread *t, struct TTTunnel *tn) {
             uint8_t buf[TT_TUNNEL_MAX_DATAGRAM];
             struct sockaddr_in from;
             socklen_t flen = sizeof from;
-            ssize_t r = recvfrom(tn->listen_sock[i], buf, sizeof buf, 0,
+            ssize_t r = tt_recvfrom(tn->listen_sock[i], buf, sizeof buf, 0,
                                  (struct sockaddr *)&from, &flen);
             if (r > 0) {
                 if (!tn->peer_set[i]) {
@@ -922,12 +917,11 @@ static void tunnel_poll_client(TTToxThread *t, struct TTTunnel *tn) {
     for (unsigned i = 0; i < tn_; i++) {
         if (tn->tcp_listen_sock[i] < 0) continue;
         for (;;) {
-            int fd = accept(tn->tcp_listen_sock[i], NULL, NULL);
+            int fd = tt_accept(tn->tcp_listen_sock[i], NULL, NULL);
             if (fd < 0) break;
-            int fl = fcntl(fd, F_GETFL, 0);
-            if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            tt_nonblock(fd);
             TTTunnelConn *c = conn_alloc(tn);
-            if (!c) { close(fd); break; }
+            if (!c) { tt_close(fd); break; }
             c->fn = tn->peer_fn;
             c->port_idx = (uint16_t)i;
             c->connid = tn->next_connid++;
@@ -1007,7 +1001,7 @@ void tt_tunnel_rx(TTToxThread *t, uint32_t fn, const uint8_t *data, size_t len) 
             host_forward(tn, fn, port_idx, payload, plen);
         } else if (fn == tn->peer_fn && port_idx < tt_port_list_len(&tn->udp_local) &&
                    tn->peer_set[port_idx] && tn->listen_sock[port_idx] >= 0) {
-            sendto(tn->listen_sock[port_idx], payload, plen, 0,
+            tt_sendto(tn->listen_sock[port_idx], payload, plen, 0,
                    (struct sockaddr *)&tn->peer[port_idx], sizeof tn->peer[port_idx]);
         }
     }
@@ -1026,7 +1020,7 @@ static void tunnel_tcp_rx_host(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
         if (c->connecting) {
             conn_pend(c, payload, plen); /* buffer until connect done */
         } else if (c->sock >= 0) {
-            send(c->sock, payload, plen, 0);
+            tt_send(c->sock, payload, plen, 0);
         }
         break;
     }
@@ -1054,7 +1048,7 @@ static void tunnel_tcp_rx_client(struct TTTunnel *tn, uint32_t fn,
     case TT_TCP_DATA: {
         TTTunnelConn *c = conn_find(tn, fn, connid);
         if (c && c->sock >= 0)
-            send(c->sock, payload, plen, 0);
+            tt_send(c->sock, payload, plen, 0);
         break;
     }
     case TT_TCP_FIN: {

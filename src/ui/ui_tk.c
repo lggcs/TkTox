@@ -26,10 +26,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include "platform.h"
 
 #define TT_TRANSCRIPT_MAX (64 * 1024)
 #define TT_LAST_MAX 48
@@ -4023,22 +4020,22 @@ static int cc_tun_accept(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const
         for (unsigned i = 0; i < ui->tun_invite_udp.count; i++) {
             uint16_t start = ui->tun_invite_udp.r[i].start;
             uint16_t cnt = ui->tun_invite_udp.r[i].count;
-            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            int s = tt_socket(AF_INET, SOCK_DGRAM, 0);
             if (s >= 0) {
                 struct sockaddr_in a = {0};
                 a.sin_family = AF_INET;
                 a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
                 a.sin_port = htons(start);
-                if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) {
+                if (tt_bind(s, (struct sockaddr *)&a, sizeof a) < 0) {
                     for (int k = 1; k < 20 && start + k < 65535; k++) {
                         a.sin_port = htons((uint16_t)(start + k));
-                        if (bind(s, (struct sockaddr *)&a, sizeof a) == 0) {
+                        if (tt_bind(s, (struct sockaddr *)&a, sizeof a) == 0) {
                             start = (uint16_t)(start + k);
                             break;
                         }
                     }
                 }
-                close(s);
+                tt_close(s);
             }
             local.r[local.count].start = start;
             local.r[local.count].count = cnt;
@@ -5156,6 +5153,20 @@ static void build_widgets(Ui *ui) {
     EV("wm", "minsize", ".", "720", "460");
 }
 
+/* Script-tree resolution shared by ui_run, the profile picker, and
+   --selfcheck. On Windows the POST_BUILD step stages a copy of the vendored
+   trees under "<exe dir>/tcl/lib/tcl8.6" and "<exe dir>/tk/lib/tk8.6", and
+   tt_exe_relative_dir prefers it (falling back to the compiled-in build-tree
+   path when the exe has not been staged). On POSIX it is the compiled-in
+   path verbatim. */
+const char *tt_tcl_script_dir(void) {
+    return tt_exe_relative_dir(TT_TCL_SCRIPT_DIR, "tcl/lib/tcl8.6");
+}
+
+const char *tt_tk_script_dir(void) {
+    return tt_exe_relative_dir(TT_TK_SCRIPT_DIR, "tk/lib/tk8.6");
+}
+
 int ui_run(TTToxThread *tt) {
     memset(&g_ui, 0, sizeof g_ui);
     g_ui.tt = tt;
@@ -5174,10 +5185,8 @@ int ui_run(TTToxThread *tt) {
        compiled in; a mismatched system script version there fails Tcl_Init with
        "version conflict for package Tcl". Point both interpreters at the vendored
        8.6.18 script trees via the documented env overrides before init. */
-    setenv("TCL_LIBRARY",
-           TT_TCL_SCRIPT_DIR, 1);
-    setenv("TK_LIBRARY",
-           TT_TK_SCRIPT_DIR, 1);
+    setenv("TCL_LIBRARY", tt_tcl_script_dir(), 1);
+    setenv("TK_LIBRARY", tt_tk_script_dir(), 1);
     g_ui.interp = Tcl_CreateInterp();
     if (!g_ui.interp) {
         TT_LOG("tk", "Tcl_CreateInterp failed");
