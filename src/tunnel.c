@@ -12,6 +12,34 @@
 
 #define TT_TUNNEL_ALLOW_MAX 64
 
+/* Push any outstanding re-key carrier for friend fn, returning true while one
+   is still outstanding. A fold is committed locally in the same step that
+   builds its carrier, so that frame is the peer's ONLY route to the new
+   chain, and every frame built afterwards already uses it — payload frames
+   must therefore not be emitted until the carrier has been handed to
+   toxcore. toxcore may refuse a packet outright (SENDQ) without queueing it,
+   so the carrier is retried until it is accepted. Carriers ride the lossless
+   channel, like the handshake, so a congestion trip costs a retry rather
+   than the frame. Two carriers can follow one fold (REKEY, then the KEMPUB
+   that republishes our regenerated keys); the bound stops a future state
+   change from spinning here. */
+static bool tunnel_carrier_retry(TTToxThread *t, uint32_t fn) {
+    if (!t->tun_e2ee || fn >= TT_MAX_FRIENDS) return false;
+    TTSession *s = &t->tun_e2ee[fn];
+    if (!s->active) return false;
+    uint8_t frame[TT_FRAME_MAX];
+    for (int i = 0; i < 2; i++) {
+        if (!tt_session_carrier_pending(s) && !tt_session_rekey_pending(s))
+            break;
+        int cn = tt_session_carrier(s, frame, sizeof frame);
+        if (cn <= 0) break;
+        if (tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)cn) != 0)
+            break; /* still parked: retry on the next poll */
+        tt_session_carrier_done(s);
+    }
+    return tt_session_carrier_pending(s);
+}
+
 /* A host invite that the friend never accepts is dropped after this many
    seconds, so the panel doesn't show a zombie "(pending)" row forever. */
 #define TT_TUNNEL_PENDING_TIMEOUT 60
@@ -46,10 +74,22 @@ typedef struct TTTunnelConn {
     uint16_t connid;  /* client-assigned id */
     int sock;         /* -1 = none yet (host: connecting) */
     bool connecting;  /* host: non-blocking connect in progress */
+    bool peer_gone;   /* peer sent FIN while we still held unacked DATA;
+                         drop the conn once the last one is acked */
+    /* Flow control (see TT_TUNNEL_TCP_WINDOW): DATA frames we sent and the
+       peer has not yet credited. A congestion failure drops the connection
+       instead of the stream, since TCP over the tunnel has no retransmit. */
+    uint16_t unacked;
+    /* DATA frames accepted since we last returned credit to the peer. */
+    uint16_t ack_due;
     /* Host: data received from the client while the server connect is still
        in progress. Flushed once the connect completes. */
     uint8_t *pend;
     size_t pend_len, pend_cap;
+    /* Host: server bytes read but not yet accepted for the tunnel (the
+       window was full at drain time). Preserves byte order. */
+    uint8_t *outbuf;
+    size_t out_len, out_cap;
 } TTTunnelConn;
 
 struct TTTunnel {
@@ -671,11 +711,12 @@ static void tunnel_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
         pkt[2] = (uint8_t)port_idx;
         memcpy(pkt + TT_TUNNEL_HEADER, data, len);
         uint8_t frame[TT_FRAME_MAX];
-        /* drain a pending re-key carrier (empty DATA) so the datagram fits */
-        if (tt_session_rekey_pending(s)) {
-            int rn = tt_session_send_lossy(s, NULL, NULL, 0, frame, sizeof frame);
-            if (rn > 0) tt_tunnel_e2ee_send(t, fn, 1, frame, (size_t)rn);
-        }
+        /* Flush re-key carriers BEFORE the datagram: a carrier is the peer's
+           only route to a fold (the frames built after it already use the
+           post-fold chain), so it must reach the peer first. A carrier the
+           transport refuses stays parked, and this datagram is dropped —
+           it would be rejected by the peer anyway. */
+        if (tunnel_carrier_retry(t, fn)) return;
         int n = tt_session_send_lossy(s, NULL, pkt, TT_TUNNEL_HEADER + len,
                                       frame, sizeof frame);
         if (n > 0) tt_tunnel_e2ee_send(t, fn, 1, frame, (size_t)n);
@@ -710,6 +751,9 @@ static TTTunnelConn *conn_alloc(struct TTTunnel *tn) {
             c->used = true;
             c->sock = -1;
             c->connecting = false;
+            c->peer_gone = false;
+            c->unacked = 0;
+            c->ack_due = 0;
             return c;
         }
     }
@@ -721,9 +765,15 @@ static void conn_free(struct TTTunnelConn *c) {
     free(c->pend);
     c->pend = NULL;
     c->pend_len = c->pend_cap = 0;
+    free(c->outbuf);
+    c->outbuf = NULL;
+    c->out_len = c->out_cap = 0;
     c->used = false;
     c->sock = -1;
     c->connecting = false;
+    c->peer_gone = false;
+    c->unacked = 0;
+    c->ack_due = 0;
 }
 
 /* Append data to a conn's pending buffer (host, while connecting).
@@ -744,32 +794,56 @@ static void conn_pend(struct TTTunnelConn *c, const uint8_t *data, size_t len) {
     c->pend_len += len;
 }
 
-/* Send a lossless TCP frame to friend fn. */
-static void tcp_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
-                     uint16_t connid, uint8_t opcode,
-                     const uint8_t *payload, size_t plen) {
+/* Send a lossless TCP frame to friend fn. Payloads are capped to the active
+   channel's limit: callers must never hand over more than
+   TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD while the E2EE channel is on, because a
+   dropped TCP frame stalls the stream with no way to recover (see
+   conn_drain_out). Oversize is logged loudly rather than silently skipped.
+
+   Returns 0 when the frame was handed to toxcore, TT_SENDQ when the peer
+   link's send queue was full (the frame was NOT queued: retry), or
+   TT_SEND_FATAL when retrying cannot help. */
+#define TT_SEND_OK 0
+#define TT_SENDQ (-1)
+#define TT_SEND_FATAL (-2)
+
+static int tcp_send_ex(TTToxThread *t, uint32_t fn, uint16_t port_idx,
+                       uint16_t connid, uint8_t opcode,
+                       const uint8_t *payload, size_t plen) {
     if (plen > TT_TUNNEL_TCP_MAX_PAYLOAD) {
-        TT_LOG("tunnel", "tcp: payload %zu > %d bytes", plen,
+        TT_LOG("tunnel", "tcp: payload %zu > %d bytes (dropped)", plen,
                TT_TUNNEL_TCP_MAX_PAYLOAD);
-        return;
+        return TT_SEND_FATAL; /* caller error, not backpressure */
     }
     /* Tunnel E2EE channel (TT_E2EE on): encrypt the whole TCP frame (header
        + payload) as a DATA frame and ride it over a lossless type-165 packet.
        A not-yet-active session drops the frame (lossy semantics — no stash). */
     if (t->tun_e2ee) {
         if (plen > TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD) {
-            TT_LOG("tunnel", "tcp: e2ee payload %zu > %d bytes", plen,
-                   TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD);
-            return;
+            TT_LOG("tunnel", "tcp: e2ee payload %zu > %d bytes (dropped)",
+                   plen, TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD);
+            return TT_SEND_FATAL;
         }
         TTSession *s = &t->tun_e2ee[fn];
-        if (!s->active) return; /* drop until handshake completes */
+        if (!s->active) return TT_SEND_OK; /* drop until handshake completes */
         uint8_t frame[TT_FRAME_MAX];
-        /* drain a pending re-key carrier (empty DATA) so the frame fits */
-        if (tt_session_rekey_pending(s)) {
-            int rn = tt_session_send_lossy(s, NULL, NULL, 0, frame, sizeof frame);
-            if (rn > 0) tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)rn);
+        /* Flush re-key carriers first, exactly as the UDP path does: a
+           carrier is the peer's only route to a fold, and the frames built
+           after it already use the post-fold chain, so it must land before
+           any payload frame. A carrier the transport refuses stays parked,
+           and this frame is reported as congestion (the caller keeps it
+           buffered and retries) rather than delivered. */
+        for (int i = 0; i < 2; i++) {
+            if (!tt_session_carrier_pending(s) && !tt_session_rekey_pending(s))
+                break;
+            int cn = tt_session_carrier(s, frame, sizeof frame);
+            if (cn <= 0) break;
+            if (tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)cn) != 0)
+                return TT_SENDQ; /* carrier still parked: retry later */
+            tt_session_carrier_done(s);
         }
+        if (tt_session_carrier_pending(s))
+            return TT_SENDQ; /* carrier must land before payload frames */
         /* the TCP frame (header + payload) is the plaintext */
         uint8_t tcp[TT_TUNNEL_TCP_HEADER + TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD];
         tcp[0] = TT_TUNNEL_TCP_PACKET_ID;
@@ -781,8 +855,24 @@ static void tcp_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
         if (plen) memcpy(tcp + TT_TUNNEL_TCP_HEADER, payload, plen);
         int n = tt_session_send_lossy(s, NULL, tcp, TT_TUNNEL_TCP_HEADER + plen,
                                       frame, sizeof frame);
-        if (n > 0) tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)n);
-        return;
+        if (n == 0) return TT_SEND_OK; /* session inactive: lossy drop */
+        if (n == TT_E2EE_CARRIER)
+            return TT_SENDQ; /* a fold landed mid-build: retry this frame */
+        if (n < 0) {
+            /* The session could not render the frame — in practice a re-key
+               header that the drain above did not clear, since that header
+               leaves no room for a full-size payload. Reporting success here
+               would count a frame as delivered that never left, and the
+               stream would stall with nothing logged at either end. */
+            TT_LOG("tunnel", "tcp: e2ee encode failed (%d) for %zu B payload",
+                   n, plen);
+            return TT_SEND_FATAL;
+        }
+        /* The E2EE wrapper can also fail to hand the packet to toxcore —
+           that must surface as backpressure, or the caller would count a
+           frame as unacked that toxcore never queued. */
+        int rc = tt_tunnel_e2ee_send(t, fn, 2, frame, (size_t)n);
+        return rc == 0 ? TT_SEND_OK : TT_SENDQ;
     }
     uint8_t pkt[TT_TUNNEL_TCP_HEADER + TT_TUNNEL_TCP_MAX_PAYLOAD];
     pkt[0] = TT_TUNNEL_TCP_PACKET_ID;
@@ -794,8 +884,131 @@ static void tcp_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
     if (plen) memcpy(pkt + TT_TUNNEL_TCP_HEADER, payload, plen);
     Tox_Err_Friend_Custom_Packet err;
     if (!tox_friend_send_lossless_packet(t->tox, fn, pkt,
-                                         TT_TUNNEL_TCP_HEADER + plen, &err))
-        TT_LOG("tunnel", "tcp send(%u): err %d", fn, (int)err);
+                                         TT_TUNNEL_TCP_HEADER + plen, &err)) {
+        if (err == TOX_ERR_FRIEND_CUSTOM_PACKET_SENDQ) return TT_SENDQ;
+        if (err != TOX_ERR_FRIEND_CUSTOM_PACKET_FRIEND_NOT_CONNECTED)
+            TT_LOG("tunnel", "tcp send(%u): err %d (lost)", fn, (int)err);
+        return TT_SEND_FATAL;
+    }
+    return TT_SEND_OK;
+}
+
+/* Send a control frame (OPEN/ACK/FIN/OPEN_FAIL/ACK). A control frame is sent
+   once, so it gets only a bounded busy-wait before it is given up on: unlike
+   DATA, a control frame is not worth stalling a connection over, and the
+   common SENDQ case is a link that is already saturated with DATA. */
+static void tcp_send(TTToxThread *t, uint32_t fn, uint16_t port_idx,
+                     uint16_t connid, uint8_t opcode,
+                     const uint8_t *payload, size_t plen) {
+    if (tcp_send_ex(t, fn, port_idx, connid, opcode, payload, plen) == TT_SENDQ)
+        TT_LOG("tunnel", "tcp ctl op %u conn %u: sendq full (lost)", opcode,
+               connid);
+}
+
+/* Read size: the socket read must never exceed the largest payload the send
+   path can actually carry. tcp_send_ex() drops anything over
+   TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD when the tunnel E2EE channel is active
+   (1312 vs the raw 1367), and a dropped TCP frame is unrecoverable: the
+   stream silently stalls mid-response. Sizing the read to the active
+   channel's limit keeps every frame sendable. */
+static size_t conn_read_max(const TTToxThread *t) {
+    return t->tun_e2ee ? TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD : TT_TUNNEL_TCP_MAX_PAYLOAD;
+}
+
+/* Append to a conn's outgoing buffer (host: server bytes the peer has not
+   accepted yet, because its flow-control window was full). Capped for the
+   same reason as conn_pend. Returns false when the cap is hit — the caller
+   then drops the connection rather than silently truncating the stream. */
+static bool conn_out_add(TTTunnelConn *c, const uint8_t *data, size_t len) {
+    if (c->out_len + len > TT_TUNNEL_PEND_MAX) return false;
+    if (c->out_len + len > c->out_cap) {
+        size_t ncap = c->out_cap ? c->out_cap * 2 : 4096;
+        while (ncap < c->out_len + len) ncap *= 2;
+        uint8_t *np = realloc(c->outbuf, ncap);
+        if (!np) return false;
+        c->outbuf = np;
+        c->out_cap = ncap;
+    }
+    memcpy(c->outbuf + c->out_len, data, len);
+    c->out_len += len;
+    return true;
+}
+
+/* Push buffered bytes to the peer while its window has room.
+   Returns 1 when the buffer is empty, 0 when the send queue is congested
+   (retry after the peer's ACKs or once toxcore drains), or -1 when retrying
+   cannot help and the caller must drop the connection. Those three outcomes
+   must stay distinct: treating congestion as a failure discards a perfectly
+   healthy connection, and toxcore's SENDQ latch trips routinely at high
+   throughput — it clears by itself a moment later. */
+static int conn_flush_out(TTToxThread *t, TTTunnelConn *c) {
+    const size_t max_read = conn_read_max(t);
+    while (c->out_len > 0 && c->unacked < TT_TUNNEL_TCP_WINDOW) {
+        size_t chunk = c->out_len < max_read ? c->out_len : max_read;
+        int rc = tcp_send_ex(t, c->fn, c->port_idx, c->connid, TT_TCP_DATA,
+                             c->outbuf, chunk);
+        if (rc == TT_SENDQ) return 0;      /* congested: retry later */
+        if (rc != TT_SEND_OK) return -1;   /* fatal */
+        c->unacked++;
+        memmove(c->outbuf, c->outbuf + chunk, c->out_len - chunk);
+        c->out_len -= chunk;
+    }
+    return c->out_len == 0 ? 1 : 0;
+}
+
+/* Read a conn's socket and forward it to the peer, buffering whatever the
+   peer's window cannot take yet. Both directions share this shape: a fast
+   local read must never outrun the link, or toxcore's send queue trips
+   (SENDQ) and the frame — which TCP over the tunnel cannot retransmit —
+   would be lost. Returns false when the connection must be dropped: socket
+   EOF/error, a frame that could not be queued, or the buffer cap. */
+static bool conn_drain_out(TTToxThread *t, TTTunnelConn *c) {
+    uint8_t buf[TT_TUNNEL_TCP_MAX_PAYLOAD];
+    const size_t max_read = conn_read_max(t);
+    int fr = conn_flush_out(t, c);
+    if (fr < 0) return false;
+    if (fr == 0) return true; /* window full: stop reading until ACKs land */
+    for (;;) {
+        ssize_t n = tt_recv(c->sock, buf, max_read, 0);
+        if (n > 0) {
+            if (!conn_out_add(c, buf, (size_t)n)) return false;
+            fr = conn_flush_out(t, c);
+            if (fr < 0) return false;
+            if (fr == 0) return true; /* resume when ACKs arrive */
+            continue;
+        }
+        if (n == 0) return false; /* EOF */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        return false; /* error */
+    }
+}
+
+/* ---- poll ---- */
+
+/* Count one DATA frame as accepted and return credit to the peer once
+   TT_TUNNEL_ACK_BATCH frames have accumulated (or immediately once the
+   window's worth has been consumed, so a sender parked on a full window is
+   released promptly). Credit is a 2-byte BE count; a lost ACK costs the
+   sender that much window until the peer eventually FINs or times out. */
+static void conn_return_credit(TTToxThread *t, TTTunnelConn *c) {
+    c->ack_due++;
+    if (c->ack_due >= TT_TUNNEL_ACK_BATCH ||
+        c->ack_due >= TT_TUNNEL_TCP_WINDOW) {
+        uint8_t credit[2] = { (uint8_t)(c->ack_due >> 8),
+                              (uint8_t)(c->ack_due & 0xff) };
+        tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_ACK, credit,
+                 sizeof credit);
+        c->ack_due = 0;
+    }
+}
+
+/* Apply credit received from the peer (2-byte BE count of accepted frames). */
+static void conn_take_credit(TTTunnelConn *c, const uint8_t *payload, size_t plen) {
+    size_t n = plen >= 2 ? ((size_t)payload[0] << 8) | payload[1] : 1;
+    if (n >= c->unacked) c->unacked = 0;
+    else c->unacked = (uint16_t)(c->unacked - n);
+    /* the peer is gone and every frame it had not accepted is now settled */
+    if (c->peer_gone && c->unacked == 0) conn_free(c);
 }
 
 /* Host: open a TCP connection to the server for a new conn. */
@@ -834,19 +1047,23 @@ static void host_open_conn(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
     }
 }
 
-/* Read available bytes from a conn socket and forward them. Returns false
-   if the socket hit EOF/error (caller should close the conn). */
+/* Drain one connection (see conn_drain_out). Used by both host and client;
+   the peer's ACK bound applies in both directions. */
 static bool conn_drain(TTToxThread *t, TTTunnelConn *c) {
-    uint8_t buf[TT_TUNNEL_TCP_MAX_PAYLOAD];
-    for (;;) {
-        ssize_t n = tt_recv(c->sock, buf, sizeof buf, 0);
-        if (n > 0) {
-            tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_DATA, buf, (size_t)n);
-            continue;
-        }
-        if (n == 0) return false; /* EOF */
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-        return false; /* error */
+    return conn_drain_out(t, c);
+}
+
+/* Mark a conn dead once its last unacked DATA frame is acknowledged, so a
+   FIN never discards bytes the peer has not accepted yet. */
+static void conn_mark_peer_gone(TTTunnelConn *c) {
+    if (c->unacked == 0) {
+        conn_free(c);
+        return;
+    }
+    c->peer_gone = true;
+    if (c->sock >= 0) {
+        tt_close(c->sock);
+        c->sock = -1;
     }
 }
 
@@ -888,6 +1105,17 @@ static void tunnel_poll_host(TTToxThread *t, struct TTTunnel *tn) {
         if (c->used && c->sock >= 0 && !conn_drain(t, c)) {
             tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_FIN, NULL, 0);
             conn_free(c);
+        }
+    }
+    /* Retry DATA frames a full window deferred earlier: the peer's ACKs
+       arrived during this poll, so buffered bytes can move now. */
+    if (t->tun_e2ee) {
+        for (int i = 0; i < TT_TUNNEL_MAX_CONNS; i++) {
+            TTTunnelConn *c = &tn->conns[i];
+            if (c->used && c->sock >= 0 && c->out_len > 0 && !conn_drain_out(t, c)) {
+                tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_FIN, NULL, 0);
+                conn_free(c);
+            }
         }
     }
 }
@@ -940,6 +1168,15 @@ static void tunnel_poll_client(TTToxThread *t, struct TTTunnel *tn) {
             conn_free(c);
         }
     }
+    /* Retry bytes a congested send queue or a full window deferred: the
+       peer's ACKs and toxcore's drained queue both land during this poll. */
+    for (int i = 0; i < TT_TUNNEL_MAX_CONNS; i++) {
+        TTTunnelConn *c = &tn->conns[i];
+        if (c->used && c->sock >= 0 && c->out_len > 0 && !conn_drain_out(t, c)) {
+            tcp_send(t, c->fn, c->port_idx, c->connid, TT_TCP_FIN, NULL, 0);
+            conn_free(c);
+        }
+    }
 }
 
 void tt_tunnel_poll(TTToxThread *t) {
@@ -983,6 +1220,13 @@ void tt_tunnel_poll(TTToxThread *t) {
         }
         if (tn->host) tunnel_poll_host(t, tn);
         else tunnel_poll_client(t, tn);
+        /* Retry an outstanding re-key carrier. Nothing else retriggers one:
+           a carrier the transport refused leaves the session unable to emit
+           payload frames (they would use the post-fold chain the peer cannot
+           read yet), so without this the stream would wedge until the peer
+           gave up. */
+        if (t->tun_e2ee && tn->peer_fn != UINT32_MAX)
+            tunnel_carrier_retry(t, tn->peer_fn);
     }
 }
 
@@ -1022,11 +1266,23 @@ static void tunnel_tcp_rx_host(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
         } else if (c->sock >= 0) {
             tt_send(c->sock, payload, plen, 0);
         }
+        /* Tell the sender the frame was dealt with: it bounds how much sits
+           unacknowledged in toxcore's send queue (see TT_TUNNEL_TCP_WINDOW).
+           Counted even while the server is still connecting, since conn_pend
+           took ownership of the bytes. */
+        conn_return_credit(t, c);
+        break;
+    }
+    case TT_TCP_ACK: {
+        TTTunnelConn *c = conn_find(tn, fn, connid);
+        if (c) conn_take_credit(c, payload, plen);
         break;
     }
     case TT_TCP_FIN: {
         TTTunnelConn *c = conn_find(tn, fn, connid);
-        if (c) conn_free(c);
+        /* Defer the close until every DATA frame we sent is acked, otherwise
+           bytes still in flight would be truncated. */
+        if (c) conn_mark_peer_gone(c);
         break;
     }
     default:
@@ -1034,7 +1290,7 @@ static void tunnel_tcp_rx_host(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
     }
 }
 
-static void tunnel_tcp_rx_client(struct TTTunnel *tn, uint32_t fn,
+static void tunnel_tcp_rx_client(TTToxThread *t, struct TTTunnel *tn, uint32_t fn,
                                  uint16_t port_idx, uint16_t connid, uint8_t opcode,
                                  const uint8_t *payload, size_t plen) {
     if (port_idx >= tt_port_list_len(&tn->tcp_local)) return;
@@ -1047,13 +1303,21 @@ static void tunnel_tcp_rx_client(struct TTTunnel *tn, uint32_t fn,
     }
     case TT_TCP_DATA: {
         TTTunnelConn *c = conn_find(tn, fn, connid);
-        if (c && c->sock >= 0)
+        if (c && c->sock >= 0) {
             tt_send(c->sock, payload, plen, 0);
+            /* bound the sender's unacknowledged frame count */
+            conn_return_credit(t, c);
+        }
+        break;
+    }
+    case TT_TCP_ACK: {
+        TTTunnelConn *c = conn_find(tn, fn, connid);
+        if (c) conn_take_credit(c, payload, plen);
         break;
     }
     case TT_TCP_FIN: {
         TTTunnelConn *c = conn_find(tn, fn, connid);
-        if (c) conn_free(c);
+        if (c) conn_mark_peer_gone(c);
         break;
     }
     default:
@@ -1081,7 +1345,7 @@ void tt_tunnel_rx_tcp(TTToxThread *t, uint32_t fn, const uint8_t *data, size_t l
         if (tn->host) {
             tunnel_tcp_rx_host(t, tn, fn, port_idx, connid, opcode, payload, plen);
         } else if (fn == tn->peer_fn) {
-            tunnel_tcp_rx_client(tn, fn, port_idx, connid, opcode, payload, plen);
+            tunnel_tcp_rx_client(t, tn, fn, port_idx, connid, opcode, payload, plen);
         }
     }
 }

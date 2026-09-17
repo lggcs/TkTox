@@ -31,9 +31,17 @@
    shared across both directions. The sender of a direction initiates the
    re-key every TT_SESSION_REKEY_EVERY frames: it publishes its keys
    (KEMPUB) if the peer does not have them, then sends REKEY (fold + fold
-   its direction), regenerates its keys and publishes them so the peer can
-   re-key the opposite direction. The receiver folds on REKEY receipt but
-   keeps its own keys until it re-keys its own direction.
+   its direction).
+   The receiver of a REKEY folds its recv direction AND ONLY THEN rotates
+   its own keypair (regenerating DH + KEM and re-publishing via KEMPUB).
+   Rotation must happen there, not on the sender's own fold: our published
+   pair is what the PEER encapsulates its next REKEY to, so replacing it
+   before that REKEY has been consumed lets a fold that is already in flight
+   target a retired pair — tt_kem_dec's implicit rejection then yields a
+   silently wrong recv root. The two peers auto-fold in the same window, so
+   rotating on the send fold diverged every transfer past ~500 KB.
+   The fresh pair is published before any pending send fold, so the peer's
+   next re-key always aims at the pair it will consume.
    The verification code derives from the HANDSHAKE root and stays stable
    across folds. */
 #include <stdbool.h>
@@ -105,6 +113,8 @@ typedef enum {
     TT_E2EE_REPLAY = -6,       /* seq already consumed */
     TT_E2EE_BUSY = -7,         /* pending ring full (handshake stalled) */
     TT_E2EE_BAD_STATE = -8,    /* e.g. REPLY with no INIT outstanding */
+    TT_E2EE_CARRIER = -9,      /* lossy: a built re-key carrier must reach
+                                  the peer before anything else is emitted */
 } TTE2EEStatus;
 
 /* transport identity material, supplied by the engine (tox thread) */
@@ -147,6 +157,18 @@ typedef struct TTRekey {
     bool published;        /* our current keys are published (peer has them) */
     bool post_fold_publish; /* publish our regenerated keys after a fold */
     bool publish_back;     /* peer published its keys; publish ours in reply */
+    /* Built-but-unsent re-key carrier (lossy/tunnel sessions only). A re-key
+       header is committed locally in the same call that builds its frame, so
+       that frame is the ONLY thing that can move the peer's chain: toxcore
+       may refuse a packet outright (SENDQ) without queueing it, and the
+       tunnel's lossless channel cannot retransmit, so dropping the frame
+       would leave the peer on the pre-fold root while we advanced ours — a
+       permanent divergence, since the peer cannot derive the new root. Keep
+       the built bytes and re-emit them until the transport accepts them; the
+       engine must not emit anything else first (later frames already use the
+       post-fold chain, and the peer would reject them). */
+    uint8_t carrier[TT_FRAME_MAX];
+    uint16_t carrier_len;  /* 0 = no carrier outstanding */
 } TTRekey;
 
 typedef struct TTSession {
@@ -234,10 +256,28 @@ int tt_session_send_lossy(TTSession *s, const TTE2EEEnv *env,
                           const uint8_t *text, size_t len,
                           uint8_t *out, size_t cap);
 
-/* True when the next emit_frame would carry a re-key header (REKEY or
-   KEMPUB), which leaves too little room for a full datagram. The tunnel
-   engine drains these as empty carrier frames before sending a datagram. */
+/* True when a re-key header is due to go out (REKEY or KEMPUB). The tunnel
+   engine turns these into the separate parked carrier (tt_session_carrier),
+   so a payload frame is never the peer's only route to a fold. */
 bool tt_session_rekey_pending(const TTSession *s);
+
+/* ---- lossy (tunnel) re-key carrier ----
+
+   A lossy session cannot attach a re-key header to a payload frame: the
+   header is committed locally when its frame is built, and the frame cannot
+   be retransmitted, so a payload frame carrying a header could be dropped
+   (or, retried verbatim, deliver its payload twice). Instead the header goes
+   out as its own empty carrier frame that is parked until the transport
+   accepts it; payload frames are never a fold route, so they stay freely
+   droppable.
+     tt_session_carrier        — build (or re-offer) the next carrier, 0 when
+                                 none is due
+     tt_session_carrier_pending— a built carrier is outstanding (the session
+                                 must not emit payload frames until it lands)
+     tt_session_carrier_done   — the transport accepted it; resume emission */
+int tt_session_carrier(TTSession *s, uint8_t *out, size_t cap);
+bool tt_session_carrier_pending(const TTSession *s);
+void tt_session_carrier_done(TTSession *s);
 
 /* Pop ONE stashed text as a DATA frame into out (same return convention).
    Call repeatedly until it returns 0. */

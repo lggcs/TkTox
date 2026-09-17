@@ -176,6 +176,78 @@ static void test_rekey_small_order_skips_fold(void) {
     CHECK(memcmp(A.s.recv.root, root_before, TT_KEY32) == 0);
 }
 
+/* Concurrent auto-re-key: both peers reach the 64-frame boundary in the same
+   window, which is what a bulk transfer does to a saturated link. Regression
+   for the shared published-keypair defect: the fold used to regenerate our
+   keypair, so when both sides folded before consuming the other's REKEY, each
+   decapsulated the in-flight ct with a retired secret and tt_kem_dec's
+   implicit rejection silently corrupted the recv root (the next frame then
+   failed AEAD and the stream stalled for good — the ~1MB transfer failure).
+   The pair must be rotated only when we APPLY the peer's REKEY, never on our
+   own send fold. */
+static void test_rekey_concurrent_fold(void) {
+    Peer A, B;
+    peer_init(&A); peer_init(&B);
+    A.env.peer_pk = B.pk; B.env.peer_pk = A.pk;
+    CHECK(handshake(&A, &B) == 0);
+
+    /* Drive BOTH sides past the re-key boundary before delivering either, so
+       each reaches the fold with the peer's keys on file and its own re-key
+       material still in flight. */
+    enum { N = TT_SESSION_REKEY_EVERY + 4 };
+    static uint8_t a[N][TT_FRAME_MAX], b[N][TT_FRAME_MAX];
+    int an[N], bn[N];
+    for (unsigned i = 0; i < N; i++) {
+        char t[16];
+        snprintf(t, sizeof t, "a%u", i);
+        an[i] = tt_session_send(&A.s, &A.env, (const uint8_t *)t, strlen(t),
+                                a[i], sizeof a[i]);
+        CHECK(an[i] > 0);
+        snprintf(t, sizeof t, "b%u", i);
+        bn[i] = tt_session_send(&B.s, &B.env, (const uint8_t *)t, strlen(t),
+                                b[i], sizeof b[i]);
+        CHECK(bn[i] > 0);
+    }
+    bool hs = false;
+    CHECK(A.s.rekey.awaiting_peer && B.s.rekey.awaiting_peer);
+
+    /* cross-deliver so each side learns the peer's published keys */
+    for (unsigned i = 0; i < N; i++)
+        CHECK(tt_session_feed(&B.s, &B.env, a[i], (size_t)an[i], got,
+                              sizeof got, &hs) > 0);
+    for (unsigned i = 0; i < N; i++)
+        CHECK(tt_session_feed(&A.s, &A.env, b[i], (size_t)bn[i], got,
+                              sizeof got, &hs) > 0);
+
+    /* both are due to fold — fold BOTH before delivering either REKEY, so each
+       ct is in flight while its target pair is retired by the sender's own
+       fold (the exact concurrent case) */
+    int ar = tt_session_send(&A.s, &A.env, (const uint8_t *)"x", 1, a[0],
+                             sizeof a[0]);
+    int br = tt_session_send(&B.s, &B.env, (const uint8_t *)"y", 1, b[0],
+                             sizeof b[0]);
+    CHECK(ar > 0 && br > 0);
+
+    /* each REKEY decrypts, but the discriminating effect is the recv ROOT: on
+       the old rotation order these folds mix a garbage secret, so the frames
+       below fail AEAD */
+    CHECK(tt_session_feed(&A.s, &A.env, b[0], (size_t)br, got, sizeof got, &hs) > 0);
+    CHECK(tt_session_feed(&B.s, &B.env, a[0], (size_t)ar, got, sizeof got, &hs) > 0);
+
+    /* The ratchets must still interoperate in both directions. Keep this
+       bounded (a plain DATA exchange, not relay_ack): on the pre-fix code the
+       session is broken and relay_ack's unacked-message drain would spin
+       forever re-requesting a re-send, turning a failure into a hang. */
+    int m = tt_session_send(&A.s, &A.env, (const uint8_t *)"post", 4, a[0],
+                            sizeof a[0]);
+    CHECK(m > 0);
+    CHECK(tt_session_feed(&B.s, &B.env, a[0], (size_t)m, got, sizeof got, &hs) == 4);
+    m = tt_session_send(&B.s, &B.env, (const uint8_t *)"post", 4, b[0],
+                        sizeof b[0]);
+    CHECK(m > 0);
+    CHECK(tt_session_feed(&A.s, &A.env, b[0], (size_t)m, got, sizeof got, &hs) == 4);
+}
+
 /* honest re-key cycle: 70 frames each way crosses the 64-frame re-key
    boundary in both directions (KEMPUB publish -> REKEY fold ->
    post-fold publish -> peer fold); every message must decrypt and the
@@ -210,6 +282,7 @@ int main(void) {
     if (sodium_init() < 0) return 2;
     test_kempub_small_order_rejected();
     test_rekey_small_order_skips_fold();
+    test_rekey_concurrent_fold();
     test_rekey_honest_cycle();
     if (fails == 0) puts("rekey: ALL PASS");
     return fails ? 1 : 0;

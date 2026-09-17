@@ -152,11 +152,31 @@ gaming use case.
 - TCP data rides lossless custom packets (type 165); the plaintext is the WHOLE 162 frame.
 - When E2EE is off, the tunnel falls back to the raw 200/162 types (plaintext over
   toxcore's transport crypto).
-- Re-key headers (REKEY/KEMPUB) leave too little room for a full datagram, so the engine
-  drains them as empty carrier frames first (`tt_session_rekey_pending`), then sends the
-  datagram as a plain DATA frame.
-- A desync on the tunnel channel re-establishes with a fresh handshake (lossy — there is
-  no reliable transport to recover the lost datagram).
+- Re-key headers (REKEY/KEMPUB) leave too little room for a full datagram, and — unlike the
+  chat path — a lossless tunnel frame has no retransmit. The header is therefore built as
+  its own empty **carrier** frame and PARKED (`TTRekey.carrier`); the engine re-offers it
+  verbatim (`tt_session_carrier` / `_pending` / `_done`, `tunnel_carrier_retry`) until
+  toxcore accepts it, and blocks every other emission meanwhile (`TT_E2EE_CARRIER`). A
+  payload frame never carries a header, so it stays freely droppable. Parked-and-retried is
+  required because the fold is committed locally in the same step that builds its carrier:
+  that frame is the peer's ONLY route to the new root, and toxcore can refuse a packet
+  outright (`SENDQ`) without queueing it, which would leave the two roots permanently apart.
+- **Re-key keypair rotation order (2026-09-17 fix).** Each side's published keypair is what
+  the PEER encapsulates its next REKEY to, and applying that REKEY folds OUR RECV direction
+  — so the pair must be rotated only when we have consumed it (in the REKEY handler of
+  `tt_session_feed`), never on our own send fold. Rotating on the send fold let a fold
+  already in flight on the wire target a pair we had just replaced; `tt_kem_dec`'s implicit
+  rejection then turned that into a silently wrong recv root. The two peers auto-fold in the
+  same window every 64 frames, so this fired on any transfer past ~500 KB (the 16-byte
+  `tunnel-test.sh` echo never reached it). After a rotation the fresh pair is published
+  before any pending send fold (`post_fold_publish` takes branch priority), so the peer's
+  next re-key always aims at the pair it will consume. Verified byte-exact at 1 MB and 5 MB
+  (0 drops, 0 SENDQ); `tunnel-test.sh` now also carries a 300 KB TCP payload across several
+  re-key boundaries as a regression.
+- A desync on the lossless (TCP) channel re-establishes with a fresh handshake. A lossy
+  datagram that fails to decrypt is dropped instead of tearing the session down — a stale
+  or reordered datagram is the far likelier cause, and a genuine desync surfaces on the
+  TCP channel, which can be diagnosed.
 
 ## AV (voice/video) E2EE — decision (2026-09-14)
 

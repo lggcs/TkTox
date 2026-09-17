@@ -622,6 +622,28 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
         if (tt_dh_shared(dh, s->rekey.eph_sk, d.hdr + TT_HDR_DATA_DH_OFF) == 0) {
             ratchet_fold(&s->recv, dh, ss);
             memcpy(s->rekey.peer_eph_pk, d.hdr + TT_HDR_DATA_DH_OFF, TT_KEY32);
+            /* Rotate our re-key keypair NOW, in the same step that consumes
+               it. Our pair is what the PEER encapsulates its next REKEY to,
+               and applying that REKEY is exactly the moment the pair it
+               targeted is spent — so rotating here is the earliest safe
+               point, and the latest one that keeps a fold already in flight
+               on the wire from targeting a retired pair (`tt_kem_dec` has
+               implicit rejection, so that would surface only as a silently
+               wrong recv root). The two peers auto-fold in the same window
+               every TT_SESSION_REKEY_EVERY frames, and rotating on our own
+               send fold instead is what diverged every transfer past ~500KB.
+               The fresh pair is published before any pending send fold (see
+               emit_frame), so the peer's next re-key targets the pair it
+               will consume.
+               `peer_have` (the PEER's keys) is deliberately untouched: it
+               goes stale only when the peer rotates, and the peer's KEMPUB
+               (sent right after its rotation) refreshes it. Our own pair is
+               what this branch rotates. */
+            tt_dh_keygen(s->rekey.eph_pk, s->rekey.eph_sk);
+            tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
+            s->rekey.have_kem = true;
+            s->rekey.published = false;
+            s->rekey.post_fold_publish = true; /* publish before any fold */
         }
         sodium_memzero(ss, sizeof ss);
         sodium_memzero(dh, sizeof dh);
@@ -656,11 +678,22 @@ int tt_session_feed(TTSession *s, const TTE2EEEnv *env, const uint8_t *in,
 
 /* ---- send ---- */
 
-/* encrypt one text into a DATA frame; when a re-key is due, the M4 re-key
-   hdr rides along: REKEY (fold our send direction) when the peer's keys
-   are on file, otherwise a publish-only KEMPUB goes out first. */
+/* encrypt one text into a DATA frame. On a lossy (tunnel) session
+   `carrier_only` selects which of the two frame kinds is built:
+     carrier_only = true  — the re-key carrier (empty plaintext; the re-key
+                            header if one is due). The result is PARKED so it
+                            can be re-offered verbatim until the transport
+                            accepts it.
+     carrier_only = false — a plain payload frame. No header is ever attached:
+                            a re-key that comes due stays pending for the next
+                            carrier build, so a payload frame can never be the
+                            peer's only route to a fold (it would have to be
+                            retried verbatim AND its payload delivered twice).
+   The non-lossy chat path always uses carrier_only = false and keeps the
+   in-line header behaviour (tox messages are retransmitted by the chat
+   reliable transport, so a lost header is recoverable there). */
 static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
-                      uint8_t *out, size_t cap) {
+                      uint8_t *out, size_t cap, bool carrier_only) {
     uint8_t key[TT_KEY32], nonce[TT_NONCE24];
     uint8_t flags = tt_aead_gcm_available()
                         ? (uint8_t)(TT_FRAME_FLAG_GCM | TT_FRAME_FLAG_AES_HW)
@@ -670,54 +703,78 @@ static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
     bool do_fold = false;
     uint8_t fold_dh[TT_KEY32], fold_ss[TT_KEY32];
 
+    /* A re-key carrier is parked until the transport accepts it (see
+       TTRekey.carrier): a fold is committed in the very call that builds its
+       carrier, so the peer can only follow through that exact frame, and the
+       frames built after it already use the new chain. Until it lands,
+       nothing else may be emitted on this session. */
+    if (s->lossy && s->rekey.carrier_len > 0) return TT_E2EE_CARRIER;
+
     /* auto-re-key trigger (every TT_SESSION_REKEY_EVERY frames); does not
        re-fire while we are already waiting for the peer's keys */
     if (!s->rekey.awaiting_peer && s->send.since_fold >= TT_SESSION_REKEY_EVERY)
         s->rekey.rekey_due = true;
 
-    if (s->rekey.rekey_due && s->rekey.peer_have) {
-        /* REKEY: fold our send direction after encrypting. The peer's
-           keys passed the contributory check on receipt, so the DH
-           cannot normally fail; on rejection (small-order point) skip
-           the REKEY header entirely — a plain frame goes out and the
-           re-key stays pending, instead of folding unwritten dh[] into
-           the send root. */
-        if (tt_dh_shared(fold_dh, s->rekey.eph_sk, s->rekey.peer_eph_pk) == 0) {
-            tt_kem_enc(hdr, fold_ss, s->rekey.peer_kem_pk);
-            memcpy(hdr + TT_HDR_DATA_DH_OFF, s->rekey.eph_pk, TT_KEY32);
-            hdr_len = TT_HDR_DATA_REKEY;
-            flags |= TT_FRAME_FLAG_KEM | TT_FRAME_FLAG_PK;
-            do_fold = true;
+    /* Only the carrier build attaches a re-key header on a lossy session; a
+       payload frame must stay plain so it is freely droppable (a header
+       there would make it the peer's only route to a fold, and it would have
+       to be retried verbatim — delivering its payload twice). */
+    if (!s->lossy || carrier_only) {
+        if (s->rekey.post_fold_publish) {
+            /* Our keypair was just rotated (we consumed the peer's REKEY and
+               folded our recv direction): publish the fresh pair before
+               anything else, so the peer's NEXT re-key targets the pair it
+               will actually consume — not the one we just retired. This takes
+               priority over a pending fold of our own send direction, which
+               uses the PEER's keys and is unaffected by our rotation;
+               deferring the publish would let the peer re-key against the
+               retired pair (the very divergence this rotation order exists to
+               prevent). */
+            memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
+            memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
+            hdr_len = TT_HDR_DATA_KEMPUB;
+            flags |= TT_FRAME_FLAG_PK;
+            s->rekey.published = true;
+            s->rekey.post_fold_publish = false;
+            s->rekey.publish_back = false; /* superseded: ours just went out */
+        } else if (s->rekey.rekey_due && s->rekey.peer_have) {
+            /* REKEY: fold our send direction after encrypting. The peer's
+               keys passed the contributory check on receipt, so the DH
+               cannot normally fail; on rejection (small-order point) skip
+               the REKEY header entirely — a plain frame goes out and the
+               re-key stays pending, instead of folding unwritten dh[] into
+               the send root. */
+            if (tt_dh_shared(fold_dh, s->rekey.eph_sk,
+                             s->rekey.peer_eph_pk) == 0) {
+                tt_kem_enc(hdr, fold_ss, s->rekey.peer_kem_pk);
+                memcpy(hdr + TT_HDR_DATA_DH_OFF, s->rekey.eph_pk, TT_KEY32);
+                hdr_len = TT_HDR_DATA_REKEY;
+                flags |= TT_FRAME_FLAG_KEM | TT_FRAME_FLAG_PK;
+                do_fold = true;
+            }
+        } else if (s->rekey.rekey_due && !s->rekey.awaiting_peer) {
+            /* publish our keys first (peer does not have them yet) */
+            if (!s->rekey.have_kem) {
+                tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
+                s->rekey.have_kem = true;
+            }
+            memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
+            memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
+            hdr_len = TT_HDR_DATA_KEMPUB;
+            flags |= TT_FRAME_FLAG_PK;
+            s->rekey.published = true;
+            s->rekey.awaiting_peer = true;
+            s->rekey.rekey_due = false; /* fold completes when the peer's
+                                           keys land */
+        } else if (s->rekey.publish_back) {
+            /* peer published its keys; publish ours back so it can fold */
+            memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
+            memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
+            hdr_len = TT_HDR_DATA_KEMPUB;
+            flags |= TT_FRAME_FLAG_PK;
+            s->rekey.published = true;
+            s->rekey.publish_back = false;
         }
-    } else if (s->rekey.rekey_due && !s->rekey.awaiting_peer) {
-        /* publish our keys first (peer does not have them yet) */
-        if (!s->rekey.have_kem) {
-            tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
-            s->rekey.have_kem = true;
-        }
-        memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
-        memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
-        hdr_len = TT_HDR_DATA_KEMPUB;
-        flags |= TT_FRAME_FLAG_PK;
-        s->rekey.published = true;
-        s->rekey.awaiting_peer = true;
-        s->rekey.rekey_due = false; /* fold completes when the peer's keys land */
-    } else if (s->rekey.post_fold_publish) {
-        /* publish our regenerated keys so the peer can re-key its direction */
-        memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
-        memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
-        hdr_len = TT_HDR_DATA_KEMPUB;
-        flags |= TT_FRAME_FLAG_PK;
-        s->rekey.published = true;
-        s->rekey.post_fold_publish = false;
-    } else if (s->rekey.publish_back) {
-        /* peer published its keys; publish ours back so it can fold */
-        memcpy(hdr, s->rekey.kem_pk, TT_KEM_PK);
-        memcpy(hdr + TT_KEM_PK, s->rekey.eph_pk, TT_KEY32);
-        hdr_len = TT_HDR_DATA_KEMPUB;
-        flags |= TT_FRAME_FLAG_PK;
-        s->rekey.published = true;
-        s->rekey.publish_back = false;
     }
 
     uint32_t seq;
@@ -737,20 +794,74 @@ static int emit_frame(TTSession *s, const uint8_t *text, size_t len,
 
     if (do_fold) {
         ratchet_fold(&s->send, fold_dh, fold_ss);
-        /* regenerate our keys and publish them next frame */
-        tt_dh_keygen(s->rekey.eph_pk, s->rekey.eph_sk);
-        tt_kem_keygen(s->rekey.kem_pk, s->rekey.kem_sk);
-        s->rekey.have_kem = true;
-        s->rekey.published = false;
-        s->rekey.post_fold_publish = true;
+        /* Our re-key keypair is deliberately NOT rotated here. That pair is
+           what the PEER encapsulates its next REKEY to, and the peer's REKEY
+           folds OUR RECV direction — so the pair must stay valid until we
+           have consumed it (see the REKEY handler in tt_session_feed, which
+           rotates *after* using it). Rotating on the send fold instead lets
+           a fold that is already in flight on the wire target a pair we have
+           just replaced: tt_kem_dec has implicit rejection, so the
+           decapsulation silently yields a wrong secret and corrupts our recv
+           root, with no error to notice. That is the concurrent-rekey stall
+           seen past ~500KB, where both peers auto-fold inside the same
+           window: each rotated on its own send fold and destroyed the pair
+           the other was still encapsulating to. */
         s->rekey.rekey_due = false;
+        /* Sending a REKEY is what makes the PEER rotate its pair (it rotates
+           on applying our REKEY, see tt_session_feed). Our cached copy of the
+           peer's keys is therefore stale now: drop it, so the next REKEY waits
+           for the peer's fresh KEMPUB instead of encapsulating to keys the
+           peer has retired — a stale ct would decapsulate to garbage and
+           corrupt the peer's recv root just as silently. */
+        s->rekey.peer_have = false;
         s->send.since_fold = 0;
         sodium_memzero(fold_dh, sizeof fold_dh);
         sodium_memzero(fold_ss, sizeof fold_ss);
     } else {
         s->send.since_fold++;
     }
+    /* Park a carrier that carries re-key material. The fold above is already
+       committed, so this frame is the peer's only route to the new root: the
+       caller must keep re-offering it verbatim until the transport accepts
+       it. Every frame built after it uses the post-fold chain and MUST NOT be
+       delivered first, or the peer rejects it (AEAD failure) and the session
+       diverges permanently. */
+    if (s->lossy && (hdr_len == TT_HDR_DATA_REKEY ||
+                     hdr_len == TT_HDR_DATA_KEMPUB) &&
+        (size_t)n <= sizeof s->rekey.carrier) {
+        memcpy(s->rekey.carrier, out, (size_t)n);
+        s->rekey.carrier_len = (uint16_t)n;
+    }
     return n;
+}
+
+/* Build the next re-key carrier for a lossy (tunnel) session, if any is due.
+   Returns the frame length (>0), 0 when no carrier is needed right now, or a
+   negative status. The frame is parked internally: re-offer it verbatim
+   until the transport accepts it (then call tt_session_carrier_done), and
+   never emit anything else on this session while a carrier is outstanding. */
+int tt_session_carrier(TTSession *s, uint8_t *out, size_t cap) {
+    if (!s->active) return 0;
+    if (s->rekey.carrier_len > 0) {
+        if (cap < s->rekey.carrier_len) return TT_E2EE_BAD_STATE;
+        memcpy(out, s->rekey.carrier, s->rekey.carrier_len);
+        return (int)s->rekey.carrier_len;
+    }
+    if (!tt_session_rekey_pending(s)) return 0;
+    return emit_frame(s, NULL, 0, out, cap, true);
+}
+
+/* True while a built-but-unsent re-key carrier is outstanding. A folded
+   session cannot emit payload frames until it lands (see TTRekey.carrier). */
+bool tt_session_carrier_pending(const TTSession *s) {
+    return s->lossy && s->rekey.carrier_len > 0;
+}
+
+/* The transport accepted the outstanding carrier: clear it and resume
+   normal emission. */
+void tt_session_carrier_done(TTSession *s) {
+    sodium_memzero(s->rekey.carrier, s->rekey.carrier_len);
+    s->rekey.carrier_len = 0;
 }
 
 int tt_session_send(TTSession *s, const TTE2EEEnv *env, const uint8_t *text,
@@ -766,28 +877,39 @@ int tt_session_send(TTSession *s, const TTE2EEEnv *env, const uint8_t *text,
         }
         return 0;
     }
-    return emit_frame(s, text, len, out, cap);
+    return emit_frame(s, text, len, out, cap, false);
 }
 
 /* Lossy (tunnel) channel send: encrypt one datagram as a DATA frame. Unlike
    tt_session_send, a not-yet-active session DROPS the datagram (lossy
-   semantics — no stash, no re-send). The caller must drain any pending
-   re-key carrier first (see tt_session_rekey_pending) so the datagram fits
-   in a plain DATA frame. */
+   semantics — no stash, no re-send). Datagrams are freely droppable, so this
+   never attaches a re-key header; any due re-key is carried by the separate
+   parked carrier (see tt_session_carrier) which the caller must drain
+   first. */
 int tt_session_send_lossy(TTSession *s, const TTE2EEEnv *env,
                           const uint8_t *text, size_t len,
                           uint8_t *out, size_t cap) {
     (void)env;
     if (len > TT_FRAME_DATA_MAX) return TT_E2EE_BAD_STATE;
     if (!s->active) return 0; /* lossy: drop, never stash */
-    return emit_frame(s, text, len, out, cap);
+    return emit_frame(s, text, len, out, cap, false);
 }
 
-/* True when the next emit_frame would carry a re-key header (REKEY or
-   KEMPUB), which leaves too little room for a full datagram. The tunnel
-   engine drains these as empty carrier frames before sending a datagram. */
+/* True when a re-key header is due to go out (REKEY or KEMPUB). The tunnel
+   engine turns these into the separate parked carrier, so a payload frame is
+   never the peer's only route to a fold and stays freely droppable.
+
+   This must mirror emit_frame's header selection EXACTLY, including its
+   auto-re-key trigger: if this says "no header" while emit_frame decides to
+   attach one, the carrier ordering breaks and the peer rejects post-fold
+   frames. */
 bool tt_session_rekey_pending(const TTSession *s) {
     if (!s->active) return false;
+    /* auto-re-key trigger in emit_frame: a header is attached on this very
+       send (and only while not already waiting for the peer's keys) */
+    if (!s->rekey.awaiting_peer &&
+        s->send.since_fold >= TT_SESSION_REKEY_EVERY)
+        return true;
     if (s->rekey.rekey_due && s->rekey.peer_have) return true;
     if (s->rekey.rekey_due && !s->rekey.awaiting_peer) return true;
     if (s->rekey.post_fold_publish) return true;
@@ -798,7 +920,8 @@ bool tt_session_rekey_pending(const TTSession *s) {
 int tt_session_flush(TTSession *s, const TTE2EEEnv *env, uint8_t *out, size_t cap) {
     (void)env;
     if (!s->active || s->n_pending == 0) return 0;
-    int n = emit_frame(s, s->pending[0].data, s->pending[0].len, out, cap);
+    int n = emit_frame(s, s->pending[0].data, s->pending[0].len, out, cap,
+                       false);
     if (n <= 0) return n;
     sodium_memzero(s->pending[0].data, sizeof s->pending[0].data);
     for (int i = 1; i < s->n_pending; i++) s->pending[i - 1] = s->pending[i];
@@ -852,7 +975,7 @@ int tt_session_rel_poll(TTSession *s, const TTE2EEEnv *env, uint8_t *out,
                 m->seq < s->rel.resend_rep_from)
                 continue;
             uint32_t old_gen = m->gen, old_seq = m->seq;
-            n = emit_frame(s, m->data, m->len, out, cap);
+            n = emit_frame(s, m->data, m->len, out, cap, false);
             if (n > 0) {
                 /* the re-send consumed a fresh seq; drop the old entry so
                    it is not re-sent again */

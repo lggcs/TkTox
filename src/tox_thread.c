@@ -296,9 +296,13 @@ static bool e2ee_rx(TTToxThread *t, TTEvent *ev) {
 
 /* send one tunnel E2EE frame over a custom packet. kind selects the packet
    type: 0 = handshake (lossless 164), 1 = UDP data (lossy 201),
-   2 = TCP data (lossless 165). */
-void tt_tunnel_e2ee_send(TTToxThread *t, uint32_t fn, int kind,
-                         const uint8_t *frame, size_t len) {
+   2 = TCP data (lossless 165). Returns 0 when toxcore took the frame, the
+   TOX_ERR_FRIEND_CUSTOM_PACKET_* code otherwise, or -1 when the frame is
+   over budget. SENDQ in particular means the packet was NOT queued: the
+   caller must retry rather than drop, since a lossless tunnel frame that
+   never leaves stalls the TCP stream for good. */
+int tt_tunnel_e2ee_send(TTToxThread *t, uint32_t fn, int kind,
+                        const uint8_t *frame, size_t len) {
     uint8_t pkt[TOX_MAX_CUSTOM_PACKET_SIZE];
     uint8_t id;
     if (kind == 0) id = TT_TUNNEL_E2EE_SIG_PACKET_ID;
@@ -306,7 +310,14 @@ void tt_tunnel_e2ee_send(TTToxThread *t, uint32_t fn, int kind,
     else id = TT_TUNNEL_E2EE_TCP_PACKET_ID;
     pkt[0] = id;
     pkt[1] = TT_TUNNEL_E2EE_VERSION;
-    if (len > sizeof pkt - 2) return;
+    if (len > TT_TUNNEL_E2EE_FRAME_MAX) {
+        /* Never silently discard: a dropped TCP frame stalls the stream with
+           no way to recover. Payload caps are derived from this budget
+           (tunnel.h), so reaching here means a caller ignored them. */
+        TT_LOG("tunnel-e2ee", "frame %zu > %d bytes (dropped)", len,
+               TT_TUNNEL_E2EE_FRAME_MAX);
+        return -1;
+    }
     memcpy(pkt + 2, frame, len);
     Tox_Err_Friend_Custom_Packet err;
     bool ok;
@@ -314,9 +325,18 @@ void tt_tunnel_e2ee_send(TTToxThread *t, uint32_t fn, int kind,
         ok = tox_friend_send_lossy_packet(t->tox, fn, pkt, len + 2, &err);
     else
         ok = tox_friend_send_lossless_packet(t->tox, fn, pkt, len + 2, &err);
-    if (!ok)
-        TT_LOG("tunnel-e2ee", "send(%u, kind %d, %zu B): err %d", fn, kind,
-               len, (int)err);
+    if (!ok) {
+        /* SENDQ is congestion backpressure and clears on its own, so it is
+           reported rather than logged (a saturated link would otherwise
+           flood the log). FRIEND_NOT_CONNECTED is the benign pre-online case
+           for retransmitted handshakes. */
+        if (err != TOX_ERR_FRIEND_CUSTOM_PACKET_SENDQ &&
+            err != TOX_ERR_FRIEND_CUSTOM_PACKET_FRIEND_NOT_CONNECTED)
+            TT_LOG("tunnel-e2ee", "send(%u, kind %d, %zu B): err %d", fn, kind,
+                   len, (int)err);
+        return (int)err;
+    }
+    return 0;
 }
 
 /* start (or restart) the tunnel E2EE session with fn as initiator */
@@ -351,9 +371,13 @@ void tt_tunnel_e2ee_tick(TTToxThread *t) {
 
 /* feed one received tunnel E2EE frame (from a 164/201/165 packet). Returns
    the plaintext length (>0 = DATA to forward), 0 = handshake/control frame
-   consumed, or a negative TTE2EEStatus. */
+   consumed, or a negative TTE2EEStatus. `lossy` marks a datagram (type 201):
+   a datagram is expendable, so a frame that cannot be decrypted is dropped
+   rather than treated as a chain desync — it is far more likely to be a
+   stale or reordered datagram than a broken ratchet, and tearing the session
+   down over one would break a healthy stream. */
 int tt_tunnel_e2ee_rx(TTToxThread *t, uint32_t fn, const uint8_t *frame,
-                      size_t len, uint8_t *pt, size_t pt_cap) {
+                      size_t len, uint8_t *pt, size_t pt_cap, bool lossy) {
     if (!t->tun_e2ee || fn >= TT_MAX_FRIENDS) return TT_E2EE_NO_SESSION;
     TTE2EEEnv env;
     e2ee_env(t, fn, &env);
@@ -372,12 +396,14 @@ int tt_tunnel_e2ee_rx(TTToxThread *t, uint32_t fn, const uint8_t *frame,
     }
     if (n == 0) return 0; /* handshake/control frame consumed */
     if (n < 0) {
-        /* a desync on the tunnel channel: re-establish (lossy — no reliable
-           transport to recover the lost datagram, so a fresh handshake is
-           the only recovery) */
-        if (n == TT_E2EE_DECODE_FAIL || n == TT_E2EE_REPLAY) {
+        /* A desync on the lossless (TCP) channel: re-establish. There is no
+           reliable transport to recover the lost frame, so a fresh handshake
+           is the only recovery. A lossy datagram gets the benefit of the
+           doubt instead: it is dropped, and any real desync shows up on the
+           TCP channel, which can actually be diagnosed. */
+        if (!lossy && (n == TT_E2EE_DECODE_FAIL || n == TT_E2EE_REPLAY)) {
             if (s->active) {
-                TT_LOG("tunnel-e2ee", "desync(%u): re-establishing", fn);
+                TT_LOG("tunnel-e2ee", "desync(%u): re-establishing (code %d)", fn, n);
                 tt_tunnel_e2ee_start(t, fn);
             }
         }
@@ -1794,7 +1820,7 @@ static void cb_friend_lossless_packet(Tox *tox, uint32_t friend_number,
         if (length < 2 || data[1] != TT_TUNNEL_E2EE_VERSION) return;
         uint8_t pt[TT_FRAME_DATA_MAX]; /* full plaintext = 162 header + payload */
         int n = tt_tunnel_e2ee_rx(t, friend_number, data + 2, length - 2,
-                                  pt, sizeof pt);
+                                  pt, sizeof pt, false);
         if (n > 0) tt_tunnel_rx_tcp(t, friend_number, pt, (size_t)n);
         return;
     }
@@ -1827,7 +1853,7 @@ static void cb_friend_lossy_packet(Tox *tox, uint32_t friend_number,
         data[1] == TT_TUNNEL_E2EE_VERSION) {
         uint8_t pt[TT_FRAME_DATA_MAX]; /* full plaintext = 200 header + payload */
         int n = tt_tunnel_e2ee_rx(t, friend_number, data + 2, length - 2,
-                                  pt, sizeof pt);
+                                  pt, sizeof pt, true);
         if (n > 0) tt_tunnel_rx(t, friend_number, pt, (size_t)n);
         return;
     }

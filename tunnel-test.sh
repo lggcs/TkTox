@@ -31,7 +31,8 @@ fi
 rm -f build-dyn/th.tox build-dyn/th.tox.oq build-dyn/th.tox.ses build-dyn/th.tox.rsum \
       build-dyn/tc.tox build-dyn/tc.tox.oq build-dyn/tc.tox.ses build-dyn/tc.tox.rsum \
       build-dyn/server-got.txt build-dyn/client-got.txt \
-      build-dyn/tcp-server-got.txt build-dyn/tcp-client-got.txt
+      build-dyn/tcp-server-got.txt build-dyn/tcp-client-got.txt \
+      build-dyn/tcp-large-*.bin build-dyn/tcp-large-*.txt
 : > build-dyn/th.log
 : > build-dyn/tc.log
 
@@ -68,20 +69,44 @@ SPID=$!
 
 # Fake TCP echo server: accepts one connection, echoes back what it reads.
 # Runs on 127.0.0.1:30012 (the SECOND disjoint TCP range).
+# Connection #1 keeps the fixed-reply contract the small-payload assertions
+# expect. Connection #2 carries a LARGE length-delimited payload and echoes it
+# verbatim: a stream of hundreds of frames crosses several 64-frame M4 re-key
+# boundaries, which is the regime where a dropped re-key carrier or a
+# concurrent re-key silently diverged the ratchet and stalled the stream. A
+# 16-byte echo never reaches that regime, which is why those defects escaped.
 python3 - <<'PY' &
 import socket
+N = 300000  # bytes; hundreds of TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD frames
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 30012))
-s.listen(1)
+s.listen(2)
 s.settimeout(120)
 try:
+    # connection #1: small fixed-reply round trip
     conn, _ = s.accept()
     conn.settimeout(120)
     data = conn.recv(2048)
     with open("build-dyn/tcp-server-got.txt", "w") as f:
         f.write(data.decode("utf-8", "replace"))
     conn.sendall(b"tcp-server-reply")
+    conn.close()
+
+    # connection #2: large payload echoed back byte for byte (self-delimiting
+    # by length, so the test never depends on FIN propagation)
+    conn, _ = s.accept()
+    conn.settimeout(120)
+    buf = b""
+    while len(buf) < N:
+        d = conn.recv(65536)
+        if not d:
+            break
+        buf += d
+    with open("build-dyn/tcp-large-server-got.bin", "wb") as f:
+        f.write(buf)
+    if len(buf) == N:
+        conn.sendall(buf)
     conn.close()
 except Exception as e:
     with open("build-dyn/tcp-server-err.txt", "w") as f:
@@ -190,6 +215,38 @@ except Exception as e:
         f.write(str(e))
 PY
 
+# TCP (large): send a multi-hundred-frame payload through a SECOND connection
+# and require an exact echo. This crosses several 64-frame M4 re-key
+# boundaries in both directions, so a lost re-key carrier or a concurrent
+# re-key (which silently corrupts a ratchet root via tt_kem_dec's implicit
+# rejection) stalls the stream and the byte count comes up short.
+python3 - "$CIP" <<'PY'
+import socket, sys
+ip = sys.argv[1]
+N = 300000
+payload = bytes((i * 7 + 13) & 0xFF for i in range(N))
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(30)
+try:
+    s.connect((ip, 30013))
+    s.sendall(payload)
+    got = b""
+    while len(got) < N:
+        d = s.recv(65536)
+        if not d:
+            break
+        got += d
+    s.close()
+    with open("build-dyn/tcp-large-client-got.bin", "wb") as f:
+        f.write(got)
+    with open("build-dyn/tcp-large-result.txt", "w") as f:
+        f.write("sent=%d received=%d match=%s\n"
+                % (N, len(got), got == payload))
+except Exception as e:
+    with open("build-dyn/tcp-large-result.txt", "w") as f:
+        f.write("EXC %s\n" % e)
+PY
+
 wait $SPID; SRC=$?
 wait $TPID; TRC=$?
 # stop the tunnel processes before clearing the trap, so they don't leak
@@ -242,4 +299,14 @@ if [ "$(cat build-dyn/tcp-client-got.txt)" != "tcp-server-reply" ]; then
     exit 1
 fi
 
-echo "tunnel PASS (UDP lossy + TCP lossless round-trips over Tox)"
+# TCP large-payload assertion: byte-exact echo across several re-key rounds
+if [ ! -f build-dyn/tcp-large-result.txt ]; then
+    echo "FAIL: large TCP payload produced no result"
+    exit 1
+fi
+if ! grep -q 'match=True' build-dyn/tcp-large-result.txt; then
+    echo "FAIL: large TCP payload did not round-trip byte-exact: $(cat build-dyn/tcp-large-result.txt)"
+    exit 1
+fi
+
+echo "tunnel PASS (UDP lossy + TCP lossless round-trips over Tox; large payload $(cat build-dyn/tcp-large-result.txt))"

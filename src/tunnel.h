@@ -69,18 +69,33 @@
 #define TT_TUNNEL_E2EE_TCP_PACKET_ID 165
 #define TT_TUNNEL_E2EE_UDP_PACKET_ID 201
 #define TT_TUNNEL_E2EE_VERSION 1
+/* Tunnel-E2EE wire budget. An E2EE frame rides a custom packet behind a
+   2-byte routing header (packet id + version), so the FRAME must fit in
+   TOX_MAX_CUSTOM_PACKET_SIZE - 2. This budget is one byte tighter than
+   TT_FRAME_MAX, which is sized for the chat path (tox messages, 1372): a
+   frame at TT_FRAME_MAX does not fit a custom packet, so tt_tunnel_e2ee_send
+   silently discarded it and the stream stalled (see conn_drain). Sizing the
+   payload caps from this budget keeps every tunnel frame sendable. */
+#define TT_TUNNEL_E2EE_ROUTING_HDR 2 /* packet id + version */
+#define TT_TUNNEL_E2EE_FRAME_MAX \
+    (TOX_MAX_CUSTOM_PACKET_SIZE - TT_TUNNEL_E2EE_ROUTING_HDR)
+/* Max DATA plaintext per E2EE frame, using the largest frame head
+   (24-byte nonce; the GCM path is smaller, hence conservative). */
+#define TT_TUNNEL_E2EE_DATA_MAX \
+    (TT_TUNNEL_E2EE_FRAME_MAX - TT_FRAME_HEAD_MAX - TT_MAC16) /* 1318 */
+
 /* Max UDP datagram payload that fits an E2EE DATA frame: the plaintext is
    the WHOLE tunnel packet (200 header + payload), so the payload is capped
    at the frame data budget minus the 3-byte 200 header. The decrypt buffer
-   on the receive side must hold the full plaintext (TT_FRAME_DATA_MAX). */
+   on the receive side (TT_FRAME_DATA_MAX) must hold the full plaintext. */
 #define TT_TUNNEL_E2EE_MAX_DATAGRAM \
-    (TT_FRAME_DATA_MAX - TT_TUNNEL_HEADER)
+    (TT_TUNNEL_E2EE_DATA_MAX - TT_TUNNEL_HEADER)
 /* Max TCP payload that fits an E2EE DATA frame: the plaintext is the WHOLE
    TCP frame (162 header + payload), so the payload is capped at the frame
    data budget minus the 6-byte 162 header. The decrypt buffer on the
-   receive side must hold the full plaintext (TT_FRAME_DATA_MAX). */
+   receive side (TT_FRAME_DATA_MAX) must hold the full plaintext. */
 #define TT_TUNNEL_E2EE_TCP_MAX_PAYLOAD \
-    (TT_FRAME_DATA_MAX - TT_TUNNEL_TCP_HEADER)
+    (TT_TUNNEL_E2EE_DATA_MAX - TT_TUNNEL_TCP_HEADER)
 
 /* Signaling opcodes. */
 enum {
@@ -96,7 +111,28 @@ enum {
     TT_TCP_OPEN_FAIL = 3, /* host->client: connect failed */
     TT_TCP_DATA = 4,      /* bidirectional stream bytes */
     TT_TCP_FIN = 5,       /* bidirectional close */
+    TT_TCP_ACK = 6,       /* receiver->sender, 2-byte BE credit: accepted
+                             that many DATA frames (flow control; see
+                             TT_TUNNEL_TCP_WINDOW) */
 };
+
+/* Outgoing TT_TCP_DATA frames a sender may have unacknowledged at once.
+   The peer returns credit — a 2-byte BE count of the frames it accepted —
+   so at most this many frames sit in toxcore's send queue per connection.
+
+   Without a bound, a fast local read (a large HTTP response) outruns the
+   link, toxcore's congestion control trips, and tox_friend_send_lossless_
+   packet returns SENDQ — the frame is never buffered and TCP over the
+   tunnel has no retransmit, so the stream stalls.
+
+   Credit is returned per frame accepted but SENT BATCHED (see
+   TT_TUNNEL_ACK_BATCH): one ACK per data frame would itself saturate the
+   return link, and a dropped ACK is unrecoverable — the sender would wait
+   for credit forever. */
+#define TT_TUNNEL_TCP_WINDOW 16u
+/* Frames a receiver may accept before returning credit. Batching keeps the
+   ACK channel ~1 frame per this many data frames. */
+#define TT_TUNNEL_ACK_BATCH 4u
 
 #define TT_TUNNEL_MAX_CONNS 64
 #define TT_TUNNEL_MAX_RANGES 8  /* max disjoint ranges per protocol */
@@ -264,18 +300,24 @@ void tt_tunnel_decline(struct TTToxThread *t, uint32_t fn);
    transport crypto). */
 
 /* Send one tunnel E2EE frame over a custom packet. kind: 0 = handshake
-   (lossless 164), 1 = UDP data (lossy 201), 2 = TCP data (lossless 165). */
-void tt_tunnel_e2ee_send(struct TTToxThread *t, uint32_t fn, int kind,
-                         const uint8_t *frame, size_t len);
+   (lossless 164), 1 = UDP data (lossy 201), 2 = TCP data (lossless 165).
+   Returns 0 when the frame was handed to toxcore, TOX_ERR_FRIEND_CUSTOM_
+   PACKET_* when it was not, or -1 for an oversize frame. A lossless caller
+   that tracks data must treat SENDQ as backpressure and retry: toxcore drops
+   such a packet outright, and TCP over the tunnel cannot retransmit it. */
+int tt_tunnel_e2ee_send(struct TTToxThread *t, uint32_t fn, int kind,
+                        const uint8_t *frame, size_t len);
 /* Start (or restart) the tunnel E2EE session with fn as initiator. */
 void tt_tunnel_e2ee_start(struct TTToxThread *t, uint32_t fn);
 /* Engine tick: INIT retransmits for every pending tunnel session. */
 void tt_tunnel_e2ee_tick(struct TTToxThread *t);
-/* Feed one received tunnel E2EE frame. Returns the plaintext length (>0 =
-   DATA to forward), 0 = handshake/control frame consumed, or a negative
-   TTE2EEStatus. */
+/* Feed one received tunnel E2EE frame. `lossy` marks a datagram (type 201):
+   such a frame is dropped on a decode failure instead of being treated as a
+   chain desync, since a stale/reordered datagram is the far likelier cause.
+   Returns the plaintext length (>0 = DATA to forward), 0 = handshake/control
+   frame consumed, or a negative TTE2EEStatus. */
 int tt_tunnel_e2ee_rx(struct TTToxThread *t, uint32_t fn,
                       const uint8_t *frame, size_t len,
-                      uint8_t *pt, size_t pt_cap);
+                      uint8_t *pt, size_t pt_cap, bool lossy);
 
 #endif
