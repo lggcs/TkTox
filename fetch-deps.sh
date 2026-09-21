@@ -35,34 +35,24 @@ DEPS="$ROOT/vendor/.deps"
 mkdir -p "$DEPS"
 cd "$DEPS"
 
-# Package -> deb name (version pinned to what the current tree uses).
-# libsodium-dev is a plain download (no version in the filename).
-declare -A DEBS=(
-  [tcl8.6]="tcl8.6_8.6.18+dfsg-1_${ARCH}.deb"
-  [tcl8.6-dev]="tcl8.6-dev_8.6.18+dfsg-1_${ARCH}.deb"
-  [libtcl8.6]="libtcl8.6_8.6.18+dfsg-1_${ARCH}.deb"
-  [tk8.6]="tk8.6_8.6.18-1_${ARCH}.deb"
-  [tk8.6-dev]="tk8.6-dev_8.6.18-1_${ARCH}.deb"
-  [libtk8.6]="libtk8.6_8.6.18-1_${ARCH}.deb"
-  [libxft2]="libxft2_2.3.6-1build2_${ARCH}.deb"
-  [libxft-dev]="libxft-dev_2.3.6-1build2_${ARCH}.deb"
-  [libopus-dev]="libopus-dev_1.6.1-1_${ARCH}.deb"
-  [libvpx-dev]="libvpx-dev_1.16.0-3_${ARCH}.deb"
-  [libasound2-dev]="libasound2-dev_1.2.15.3-1ubuntu1.1_${ARCH}.deb"
-)
-
-# libsodium-dev has no arch in the filename; fetch the arch-specific one.
-SODIUM_DEB="libsodium-dev.deb"
-SODIUM_POOL="pool/main/libs/libsodium"
-
-# Map deb -> extraction dir (the pkg name under .deps/).
-declare -A DIR=(
-  [tcl8.6]=tcl [tcl8.6-dev]=tcl [libtcl8.6]=tcl
-  [tk8.6]=tk [tk8.6-dev]=tk [libtk8.6]=tk
-  [libxft2]=xft [libxft-dev]=xft
-  [libopus-dev]=opus
-  [libvpx-dev]=vpx
-  [libasound2-dev]=alsa
+# Pinned debs as "source_pkg|deb_filename|extraction_dir".
+# Versions pinned to what the current tree was verified with. The pool path
+# is the SOURCE package (Ubuntu lays pools out by source, not binary name:
+# libopus-dev lives in pool/main/o/opus, not libo/libopus-dev), so it is
+# explicit per entry instead of derived from the binary name.
+DEBS=(
+  "tcl8.6|tcl8.6_8.6.18+dfsg-1_${ARCH}.deb|tcl"
+  "tcl8.6|tcl8.6-dev_8.6.18+dfsg-1_${ARCH}.deb|tcl"
+  "tcl8.6|libtcl8.6_8.6.18+dfsg-1_${ARCH}.deb|tcl"
+  "tk8.6|tk8.6_8.6.18-1_${ARCH}.deb|tk"
+  "tk8.6|tk8.6-dev_8.6.18-1_${ARCH}.deb|tk"
+  "tk8.6|libtk8.6_8.6.18-1_${ARCH}.deb|tk"
+  "xft|libxft2_2.3.6-1build2_${ARCH}.deb|xft"
+  "xft|libxft-dev_2.3.6-1build2_${ARCH}.deb|xft"
+  "opus|libopus-dev_1.6.1-1_${ARCH}.deb|opus"
+  "libvpx|libvpx-dev_1.16.0-3_${ARCH}.deb|vpx"
+  "alsa-lib|libasound2-dev_1.2.15.3-1ubuntu1.1_${ARCH}.deb|alsa"
+  "libsodium|libsodium-dev_1.0.18-2_${ARCH}.deb|sodium"
 )
 
 fetch() { # url outfile
@@ -82,23 +72,45 @@ extract() { # deb dir
     dpkg-deb -x "$deb" "$dir"
 }
 
-# libsodium-dev: fetch + extract.
-fetch "$MIRROR/$SODIUM_POOL/$SODIUM_DEB" "$SODIUM_DEB" || true
-if [ -f "$SODIUM_DEB" ]; then extract "$SODIUM_DEB" sodium; fi
-
-# The rest: fetch + extract into their dirs.
-for pkg in "${!DEBS[@]}"; do
-    deb="${DEBS[$pkg]}"
-    dir="${DIR[$pkg]}"
-    # pool path: derive from the package name's first letter(s).
-    # tcl8.6 -> pool/main/t/tcl8.6 ; libxft2 -> pool/main/libx/libxft2 ; etc.
-    case "$pkg" in
-        lib*) pool="pool/main/lib${pkg:3:1}/${pkg}" ;;
-        *)    pool="pool/main/${pkg:0:1}/${pkg}" ;;
+# Fetch + extract each pinned deb; a single download failure is fatal so a
+# broken URL cannot masquerade as a provisioned tree.
+for entry in "${DEBS[@]}"; do
+    IFS='|' read -r src deb dir <<<"$entry"
+    case "$src" in
+        lib*) prefix="${src:0:4}" ;;   # Ubuntu pool: lib* -> first 4 chars (libvpx -> libv)
+        *)    prefix="${src:0:1}" ;;
     esac
-    fetch "$MIRROR/$pool/$deb" "$deb" || continue
+    fetch "$MIRROR/pool/main/$prefix/$src/$deb" "$deb"
     extract "$deb" "$dir"
 done
+
+# Host -dev set: what xft.pc's Requires.private pulls in (fontconfig,
+# freetype2) plus their own transitive .pc needs (png, brotli, bz2). On a
+# normal desktop these are the BUILD.md §3b apt packages; this provisioner
+# extracts them into vendor/.host-devs/ so hosts without the -dev packages
+# can still configure the build. env.sh adds the tree to PKG_CONFIG_PATH.
+HOST_DEBS=(
+  "fontconfig|libfontconfig-dev_2.17.1-3ubuntu1_${ARCH}.deb"
+  "freetype|libfreetype-dev_2.14.2+dfsg-1ubuntu0.1_${ARCH}.deb"
+  "libpng1.6|libpng-dev_1.6.58-1_${ARCH}.deb"
+  "brotli|libbrotli-dev_1.2.0-3build1_${ARCH}.deb"
+  "bzip2|libbz2-dev_1.0.8-6ubuntu0.1_${ARCH}.deb"
+)
+HOST_DEVS="$ROOT/vendor/.host-devs"
+mkdir -p "$HOST_DEVS"
+cd "$HOST_DEVS"
+
+for entry in "${HOST_DEBS[@]}"; do
+    IFS='|' read -r src deb <<<"$entry"
+    case "$src" in
+        lib*) prefix="${src:0:4}" ;;
+        *)    prefix="${src:0:1}" ;;
+    esac
+    fetch "$MIRROR/pool/main/$prefix/$src/$deb" "$deb"
+    dpkg-deb -x "$deb" "$HOST_DEVS"
+done
+
+cd "$DEPS"
 
 # Patch pkg-config files to point at the vendored tree (tcl/tk/opus/vpx/sodium).
 # alsa and xft keep prefix=/usr (system libs); only their libdir triplet matters.

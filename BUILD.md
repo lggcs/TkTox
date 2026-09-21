@@ -61,6 +61,10 @@ cd TkTox
 bash fetch-deps.sh arm64        # or amd64 / riscv64
 ```
 
+Or run `bash fetch-vendor.sh` (see §2b below), which provisions *everything*
+under `vendor/`: these debs, the pinned `c-toxcore` checkout, and the
+`sntrup761` KEM source.
+
 The debs are downloaded over HTTPS. TLS protects the fetch against a
 network MITM but not against a compromised mirror; for hardened builds,
 provision from a local apt mirror or aptly snapshot instead (apt's Release
@@ -78,6 +82,46 @@ signatures verify what a plain curl cannot).
 
 Each is provisioned with both `.a` (static) and `.so` (shared) where the
 upstream deb ships them, so the same tree serves both build paths.
+
+### 2b. Source-code vendor tree (fetch-vendor.sh)
+
+`vendor/` is gitignored (third-party code is not tracked in this repo). A
+fresh clone therefore has an **empty** `vendor/`, and `fetch-deps.sh` only
+covers the `vendor/.deps` part. The build also hard-requires two source-code
+pieces that CMake compiles directly:
+
+| Path                  | What                                      | Pinned at |
+|-----------------------|-------------------------------------------|-----------|
+| `vendor/c-toxcore`    | toxcore/toxav/toxencryptsave (git clone + `third_party/cmp` submodule) | `2a0b2cb382f4ab0e9b5f23c813d2ee54e0fe2f61` (TokTok/c-toxcore master, 2026-09-13) |
+| `vendor/sntrup761`    | SNTRUP761 KEM (4 files: sntrup761.{c,h}, sha512.{c,h}) | content-stable (public-domain supercop-derived code; only sntrup761.c is compiled — `crypto_hash_sha512` resolves to libsodium's) |
+| `vendor/.host-devs`   | host `-dev` set fetched as debs: `libfontconfig-dev`, `libfreetype-dev`, `libpng-dev`, `libbrotli-dev`, `libbz2-dev` | versions pinned in `fetch-deps.sh` (see the `HOST_DEBS` table) |
+
+`vendor/.host-devs` stands in for the §3b apt packages on hosts that do not
+have them (containers, minimal images): `xft.pc` declares
+`Requires.private: fontconfig, freetype2`, so the configure step needs their
+`.pc` files on `PKG_CONFIG_PATH` even though TkTox itself never includes
+those headers. `env.sh` adds the tree to the search path automatically. On a
+normal desktop with §3b installed the tree is harmless (its `.pc` files are
+simply shadowed or equivalent).
+
+`fetch-vendor.sh` provisions all of it in the right order:
+
+```sh
+cd TkTox
+bash fetch-vendor.sh            # c-toxcore + sntrup761 + debs for host arch
+bash fetch-vendor.sh win        # ... plus the mingw .deps-win tree
+bash fetch-vendor.sh check      # verify what is present/missing
+```
+
+Subcommands: `sources` (c-toxcore + sntrup761), `linux [arch]` (debs),
+`win` (.deps-win), `check`, `clean`. Idempotent: an already-provisioned
+component is skipped unless `--force` is given. On a fresh clone:
+
+```sh
+bash fetch-vendor.sh            # host arch, everything
+. ./env.sh
+cmake -S . -B build && cmake --build build -j
+```
 
 ---
 

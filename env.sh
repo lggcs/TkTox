@@ -28,12 +28,14 @@ export TT_DEPS_TRIPLET
 # Root of the vendored dependency tree (inside TkTox/vendor/).
 TT_DEPS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/vendor/.deps
 
-# pkg-config search path: vendored .pc dirs first, then the system triplet.
+# pkg-config search path: vendored .pc dirs first, then the vendored host
+# -dev tree (fontconfig/freetype2/png/brotli/bz2 for xft.pc's Requires.private),
+# then the system triplet.
 TT_PC=""
 for pkg in tcl tk sodium opus vpx xft alsa; do
     TT_PC="$TT_DEPS_ROOT/$pkg/usr/lib/$TT_DEPS_TRIPLET/pkgconfig${TT_PC:+:$TT_PC}"
 done
-export PKG_CONFIG_PATH="$TT_PC:/usr/lib/$TT_DEPS_TRIPLET/pkgconfig:/usr/share/pkgconfig"
+export PKG_CONFIG_PATH="$TT_PC:$TT_DEPS_ROOT/../.host-devs/usr/lib/$TT_DEPS_TRIPLET/pkgconfig:$TT_DEPS_ROOT/../.host-devs/usr/share/pkgconfig:/usr/lib/$TT_DEPS_TRIPLET/pkgconfig:/usr/share/pkgconfig"
 
 # Vendored Xft is a transitive dep of libtk8.6 not covered by RUNPATH.
 export LD_LIBRARY_PATH="$TT_DEPS_ROOT/xft/usr/lib/$TT_DEPS_TRIPLET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

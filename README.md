@@ -104,11 +104,29 @@ Tor hides your real IP address from peers and Tox infrastructure. A global obser
 
 ## Building
 
-The project uses vendored dependencies in `vendor/.deps/`, including Tcl, Tk, Sodium, Opus, VPX, Xft, and ALSA.
+The project uses vendored dependencies in `vendor/` — Tcl, Tk, Sodium, Opus,
+VPX, Xft, ALSA (`vendor/.deps/`), the pinned `c-toxcore` checkout, and the
+`sntrup761` KEM. `vendor/` is gitignored (third-party code), so a fresh clone
+provisions it with one command:
+
+```bash
+bash fetch-vendor.sh            # everything for the host arch (Linux)
+bash fetch-vendor.sh win        # ... or for the mingw Windows build
+bash fetch-vendor.sh check      # report what is present / missing
+```
+
+`fetch-vendor.sh` clones `c-toxcore` at a pinned commit (with its `cmp`
+submodule), restores the tracked `sntrup761` snapshot, and drives
+`fetch-deps.sh` / `fetch-deps-win.sh` for the binary deps — including the
+host `-dev` set (fontconfig, freetype, png, brotli, bz2) that `xft.pc`
+requires when the host lacks those `-dev` packages. The tiny public-domain
+`sntrup761` KEM source itself is tracked in `vendor-sntrup761/` (see
+BUILD.md §2b).
 
 ### Native Linux build
 
 ```bash
+bash fetch-vendor.sh            # first time on a fresh clone
 . ./env.sh
 cmake --build build --target TkTox -j4
 ```
